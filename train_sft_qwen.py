@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--grad_acc", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Specific checkpoint path to resume from.")
     args = parser.parse_args()
 
     print(f"Loading tokenizer: {args.model_path}")
@@ -29,9 +31,10 @@ def main():
     print(f"Loading model: {args.model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        torch_dtype=torch.float16, # T4 is FP16-only
         trust_remote_code=True,
-        device_map="auto"
+        device_map="auto",
+        attn_implementation="sdpa", # Force the fast/memory-efficient path
     )
 
     print(f"Loading dataset: {args.dataset}")
@@ -40,8 +43,6 @@ def main():
     dataset = load_from_disk(raw_path)
 
     # Format dataset for conversational SFT
-    # Qwen expects a list of messages. We'll build the conversation history:
-    # System prompt, User question, Assistant answer (reasoning + final choice).
     from utils import format_target
     
     def format_dataset(example):
@@ -68,10 +69,6 @@ def main():
     formatted_dataset = dataset.map(format_dataset, remove_columns=dataset.column_names)
     print(f"Formatted dataset: {len(formatted_dataset)} examples")
 
-    # Use standard SFTTrainer logic for causal LMs
-    # In newer TRL versions, the completion only data collator is removed or implicit.
-    # We will use the default data collator provided by SFTTrainer.
-
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -81,11 +78,11 @@ def main():
         weight_decay=0.01,
         logging_steps=10,
         save_strategy="epoch",
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
+        fp16=True, # T4 doesn't support BF16
         gradient_checkpointing=True,
         report_to="none",
         max_length=args.max_seq_length,
+        packing=True, # Pack multiple examples into one sequence for speed
         optim="adamw_8bit",
         dataloader_num_workers=0,
     )
@@ -108,7 +105,23 @@ def main():
     )
 
     print("Starting Normal Fine-Tuning (SFT) on Qwen...")
-    trainer.train()
+    
+    # Check for existing checkpoints to resume from
+    resume_from_checkpoint = args.resume_from_checkpoint
+    if resume_from_checkpoint is None and os.path.isdir(args.output_dir):
+        checkpoints = [
+            os.path.join(args.output_dir, d) 
+            for d in os.listdir(args.output_dir) 
+            if d.startswith("checkpoint-")
+        ]
+        if checkpoints:
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+            resume_from_checkpoint = checkpoints[-1]
+            print(f"Auto-resuming from latest checkpoint: {resume_from_checkpoint}")
+    elif resume_from_checkpoint is not None:
+        print(f"Resuming from specified checkpoint: {resume_from_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     
     print(f"Saving model to {args.output_dir}")
     trainer.save_model()

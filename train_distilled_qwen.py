@@ -176,6 +176,8 @@ def main():
                         help="Weight of KD loss (0 = pure CE, 1 = pure KD).")
     parser.add_argument("--temp",          type=float, default=2.0,
                         help="Distillation temperature.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Specific checkpoint path to resume from.")
     args = parser.parse_args()
 
     if args.logits_file is None:
@@ -208,6 +210,7 @@ def main():
         args.student_model,
         torch_dtype=torch.float16,   # T4 is FP16-only (no BF16 support)
         trust_remote_code=True,
+        attn_implementation="sdpa",  # Fast path for T4
     )
 
     # ── Dataset ──────────────────────────────────────────────────────────────
@@ -274,7 +277,24 @@ def main():
     )
 
     print("Starting distillation training …")
-    trainer.train()
+    
+    # Check for existing checkpoints to resume from
+    resume_from_checkpoint = args.resume_from_checkpoint
+    if resume_from_checkpoint is None and os.path.isdir(args.output_dir):
+        checkpoints = [
+            os.path.join(args.output_dir, d) 
+            for d in os.listdir(args.output_dir) 
+            if d.startswith("checkpoint-")
+        ]
+        if checkpoints:
+            # Sort by checkpoint number
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+            resume_from_checkpoint = checkpoints[-1]
+            print(f"Auto-resuming from latest checkpoint: {resume_from_checkpoint}")
+    elif resume_from_checkpoint is not None:
+        print(f"Resuming from specified checkpoint: {resume_from_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     print(f"Saving model to {args.output_dir}")
     trainer.save_model()
