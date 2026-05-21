@@ -148,12 +148,13 @@ def build_formatted_dataset(raw_hf_dataset, dataset_name: str):
 
         return {"messages": out_messages, "example_id": out_ids}
 
+    print(f"Mapping dataset (num_proc=1 for stability) …")
     return raw_hf_dataset.map(
         _format,
         batched=True,
         batch_size=256,
         remove_columns=raw_hf_dataset.column_names,
-        num_proc=4,
+        num_proc=1, # Multiprocessing often hangs on Kaggle/Colab
     )
 
 
@@ -191,9 +192,10 @@ def main():
         )
     print(f"Loading teacher logits from {args.logits_file} …")
     logits_list = torch.load(args.logits_file, weights_only=False)
+    print(f"  Raw logits loaded. Converting to dictionary …")
     # Key by id for O(1) lookup in compute_loss
     teacher_logits = {item["id"]: item for item in logits_list}
-    print(f"  {len(teacher_logits)} examples loaded.")
+    print(f"  {len(teacher_logits)} examples loaded and indexed.")
 
     # ── Tokenizer ────────────────────────────────────────────────────────────
     print(f"Loading tokenizer from {args.student_model}")
@@ -211,7 +213,9 @@ def main():
         torch_dtype=torch.float16,   # T4 is FP16-only (no BF16 support)
         trust_remote_code=True,
         attn_implementation="sdpa",  # Fast path for T4
+        device_map="auto",           # Ensure model is on GPU
     )
+    print("  Student model loaded.")
 
     # ── Dataset ──────────────────────────────────────────────────────────────
     print(f"Loading dataset: {args.dataset}")
