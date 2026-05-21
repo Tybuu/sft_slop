@@ -72,8 +72,8 @@ class OnTheFlyDistillationTrainer(SFTTrainer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="tooluse")
-    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--student_model", type=str, default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--student_model", type=str, default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--output_dir", type=str, default="./qwen-distilled-tooluse")
     parser.add_argument("--epochs", type=int, default=3)
     # T4 has 16 GB VRAM; batch_size=2 with LoRA+gc fits comfortably
