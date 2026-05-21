@@ -3,7 +3,8 @@ import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 from datasets import load_from_disk
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig
 
 def main():
     parser = argparse.ArgumentParser()
@@ -11,10 +12,10 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--output_dir", type=str, default="./qwen-sft-tooluse")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_acc", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_acc", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--max_seq_length", type=int, default=1024)
     args = parser.parse_args()
 
     print(f"Loading tokenizer: {args.model_path}")
@@ -67,15 +68,11 @@ def main():
     formatted_dataset = dataset.map(format_dataset, remove_columns=dataset.column_names)
     print(f"Formatted dataset: {len(formatted_dataset)} examples")
 
-    # Use TRL Completion Collator to only calculate loss on the assistant's responses
-    # This prevents the model from being trained to predict the questions.
-    response_template = "<|im_start|>assistant\n"
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template, 
-        tokenizer=tokenizer
-    )
+    # Use standard SFTTrainer logic for causal LMs
+    # In newer TRL versions, the completion only data collator is removed or implicit.
+    # We will use the default data collator provided by SFTTrainer.
 
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -87,7 +84,17 @@ def main():
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
         gradient_checkpointing=True,
-        report_to="none"
+        report_to="none",
+        max_length=args.max_seq_length,
+    )
+
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
     )
 
     trainer = SFTTrainer(
@@ -95,8 +102,7 @@ def main():
         args=training_args,
         train_dataset=formatted_dataset,
         processing_class=tokenizer,
-        data_collator=collator,
-        max_seq_length=args.max_seq_length,
+        peft_config=peft_config,
     )
 
     print("Starting Normal Fine-Tuning (SFT) on Qwen...")

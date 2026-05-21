@@ -1,0 +1,6 @@
+torch
+datasets
+trl
+accelerate
+git+https://github.com/huggingface/transformers.git
+git+https://github.com/huggingface/peft.git
