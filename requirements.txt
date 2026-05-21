@@ -2,6 +2,7 @@ torch
 datasets
 trl
 accelerate
+bitsandbytes>=0.43.0
 torchao>=0.16.0
 git+https://github.com/huggingface/transformers.git
 git+https://github.com/huggingface/peft.git
