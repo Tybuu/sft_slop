@@ -83,7 +83,7 @@ def main():
         save_strategy="epoch",
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
         report_to="none",
         max_length=args.max_seq_length,
         optim="adamw_torch_fused",
