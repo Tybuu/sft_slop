@@ -21,11 +21,10 @@ where L is the number of non-padding (non-prompt) response tokens.
 
 import argparse
 import os
-# Restrict to a single GPU on Kaggle T4x2
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data_loader import load_sdft_dataset, format_prompt
@@ -33,25 +32,70 @@ from utils import format_target
 
 TOP_K = 100
 
+class LogitDataset(Dataset):
+    def __init__(self, data, tokenizer, dataset_name, max_length):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.dataset_name = dataset_name
+        self.max_length = max_length
 
-def build_example_inputs(tokenizer, prompt: str, response: str, max_length: int):
-    """
-    Tokenize [prompt + response] as a causal LM would see it.
-    Returns input_ids and the index of the first response token so we know
-    which logit positions correspond to response tokens.
-    """
-    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
+    def __len__(self):
+        return len(self.data)
 
-    # Concatenate; teacher sees the full sequence
-    full_ids = prompt_ids + response_ids
-    if len(full_ids) > max_length:
-        full_ids = full_ids[:max_length]
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        prompt = format_prompt(item)
+        if self.dataset_name == "tooluse":
+            response = format_target(item["target"])
+        else:
+            response = item["target"]
 
-    response_start = len(prompt_ids)           # index of first response token
-    response_end = min(len(prompt_ids) + len(response_ids), max_length)
-    return full_ids, response_start, response_end
+        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        response_ids = self.tokenizer(response, add_special_tokens=False)["input_ids"]
 
+        full_ids = prompt_ids + response_ids
+        if len(full_ids) > self.max_length:
+            full_ids = full_ids[:self.max_length]
+
+        resp_start = len(prompt_ids)
+        resp_end = min(len(prompt_ids) + len(response_ids), self.max_length)
+        
+        return {
+            "id": item["id"],
+            "input_ids": full_ids,
+            "resp_start": resp_start,
+            "resp_end": resp_end
+        }
+
+def collate_fn(batch, tokenizer):
+    max_len = max(len(ex["input_ids"]) for ex in batch)
+    padded_ids = []
+    attention_masks = []
+    ids = []
+    resp_starts = []
+    resp_ends = []
+    original_lens = []
+
+    for ex in batch:
+        original_len = len(ex["input_ids"])
+        pad_len = max_len - original_len
+        # Left padding is standard for generation, but here we just need a batch
+        padded_ids.append([tokenizer.pad_token_id] * pad_len + ex["input_ids"])
+        attention_masks.append([0] * pad_len + [1] * original_len)
+        ids.append(ex["id"])
+        resp_starts.append(ex["resp_start"])
+        resp_ends.append(ex["resp_end"])
+        original_lens.append(original_len)
+
+    return {
+        "input_ids": torch.tensor(padded_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
+        "ids": ids,
+        "resp_starts": torch.tensor(resp_starts, dtype=torch.long),
+        "resp_ends": torch.tensor(resp_ends, dtype=torch.long),
+        "original_lens": torch.tensor(original_lens, dtype=torch.long),
+        "max_len": max_len
+    }
 
 def main():
     parser = argparse.ArgumentParser()
@@ -61,154 +105,111 @@ def main():
     parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-2B",
                         help="HuggingFace model ID for the teacher.")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output .pt file path. Defaults to "
-                             "teacher_logits_qwen_<dataset>.pt")
+                        help="Output .pt file path.")
     parser.add_argument("--max_length", type=int, default=1024,
-                        help="Maximum sequence length passed to the teacher.")
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help="Number of examples to process per GPU forward pass.")
+                        help="Maximum sequence length.")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Batch size per GPU(s).")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Truncate dataset (for testing).")
+                        help="Truncate dataset.")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="DataLoader workers. Set to 0 to avoid hangs on Kaggle.")
     parser.add_argument("--compile", action="store_true",
-                        help="Compile the teacher model using torch.compile (can take a long time to start).")
+                        help="Compile the teacher model.")
     args = parser.parse_args()
 
     if args.output is None:
         args.output = f"teacher_logits_qwen_{args.dataset}.pt"
 
-    # ── Device ──────────────────────────────────────────────────────────────
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use only a single GPU (GPU 0) for teacher inference.
-    print(f"Teacher will run on: {device}")
+    print(f"Device: {device}, GPUs: {torch.cuda.device_count()}")
 
-    # ── Load teacher ─────────────────────────────────────────────────────────
     print(f"Loading teacher: {args.teacher_model}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.teacher_model, trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     teacher = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
-        torch_dtype=torch.float16,   # T4 is FP16-only
+        torch_dtype=torch.float16,
         trust_remote_code=True,
-        attn_implementation="sdpa",  # scaled-dot-product attention — faster on T4
+        attn_implementation="sdpa",
     ).to(device)
     teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
+    
+    if torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
+        teacher = torch.nn.DataParallel(teacher)
 
-    # Optional: compile teacher for faster repeated inference
     if args.compile:
-        print("Compiling teacher with torch.compile …")
+        print("Compiling teacher …")
         teacher = torch.compile(teacher, mode="reduce-overhead", dynamic=True)
 
-    # ── Load dataset ─────────────────────────────────────────────────────────
     print(f"Loading dataset: {args.dataset}")
     train_data = load_sdft_dataset(args.dataset, "train")
     if args.limit:
         train_data = train_data[: args.limit]
 
-    # ── Resume support ────────────────────────────────────────────────────────
     results: list[dict] = []
     processed_ids: set[str] = set()
     if os.path.exists(args.output):
         results = torch.load(args.output, weights_only=False)
         processed_ids = {item["id"] for item in results}
         train_data = [ex for ex in train_data if ex["id"] not in processed_ids]
-        print(f"Resuming — {len(processed_ids)} examples already done, "
-              f"{len(train_data)} remaining.")
+        print(f"Resuming — {len(processed_ids)} done, {len(train_data)} remaining.")
 
-    print(f"Processing {len(train_data)} examples  (top-k = {TOP_K}) …")
+    dataset = LogitDataset(train_data, tokenizer, args.dataset, args.max_length)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.num_workers,
+        collate_fn=lambda b: collate_fn(b, tokenizer),
+        pin_memory=True
+    )
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    batch_inputs: list[dict] = []   # accumulate raw examples
-    batch_meta: list[tuple] = []    # (example_id, response_start, response_end)
+    save_every = 500
+    print(f"Processing {len(train_data)} examples with batch_size={args.batch_size} …")
 
-    def flush_batch():
-        """Run one batched teacher forward and append results."""
-        if not batch_inputs:
-            return
-
-        # Pad to same length for batched forward
-        max_len = max(len(ex["input_ids"]) for ex in batch_inputs)
-        padded_ids = []
-        attention_masks = []
-        for ex in batch_inputs:
-            pad_len = max_len - len(ex["input_ids"])
-            padded_ids.append([tokenizer.pad_token_id] * pad_len + ex["input_ids"])
-            attention_masks.append([0] * pad_len + [1] * len(ex["input_ids"]))
-
-        input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
-        attention_mask = torch.tensor(attention_masks, dtype=torch.long, device=device)
-
+    for idx, batch in enumerate(tqdm(dataloader)):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        
         with torch.inference_mode():
             outputs = teacher(input_ids=input_ids, attention_mask=attention_mask)
-            # logits: (B, L, V)
-            logits = outputs.logits
+            logits = outputs.logits # (B, L, V)
 
-        for i, (example_id, resp_start, resp_end) in enumerate(batch_meta):
-            # Offset into padded sequence
-            pad_offset = max_len - len(batch_inputs[i]["input_ids"])
-            # Response token logits: position [resp_start-1 … resp_end-2] predict
-            # tokens at [resp_start … resp_end-1].  We shift by 1 (next-token pred).
-            # padded index of the first response token prediction logit:
+        max_len = batch["max_len"]
+        for i in range(len(batch["ids"])):
+            example_id = batch["ids"][i]
+            resp_start = batch["resp_starts"][i].item()
+            resp_end = batch["resp_ends"][i].item()
+            original_len = batch["original_lens"][i].item()
+            
+            pad_offset = max_len - original_len
             first_logit_idx = pad_offset + resp_start - 1
-            last_logit_idx  = pad_offset + resp_end - 1    # exclusive
+            last_logit_idx  = pad_offset + resp_end - 1
 
             if first_logit_idx < 0 or last_logit_idx <= first_logit_idx:
-                batch_inputs.clear()
-                batch_meta.clear()
                 continue
 
-            resp_logits = logits[i, first_logit_idx:last_logit_idx, :]  # (L_resp, V)
-
-            # Softmax in FP32, then take top-100
+            resp_logits = logits[i, first_logit_idx:last_logit_idx, :]
             probs = torch.softmax(resp_logits.float(), dim=-1)
-            top_probs, top_indices = torch.topk(probs, TOP_K, dim=-1)   # (L_resp, 100)
+            top_probs, top_indices = torch.topk(probs, TOP_K, dim=-1)
 
             results.append({
                 "id":          example_id,
-                "top_probs":   top_probs.cpu().half(),     # FP16 to save disk space
+                "top_probs":   top_probs.cpu().half(),
                 "top_indices": top_indices.cpu().to(torch.int32),
             })
 
-        batch_inputs.clear()
-        batch_meta.clear()
-
-    save_every = 200   # checkpoint to disk every N examples
-    for idx, item in enumerate(tqdm(train_data)):
-        prompt = format_prompt(item)
-        if args.dataset == "tooluse":
-            response = format_target(item["target"])
-        else:
-            response = item["target"]
-
-        full_ids, resp_start, resp_end = build_example_inputs(
-            tokenizer, prompt, response, args.max_length
-        )
-
-        if resp_start >= resp_end:
-            # Nothing to learn from this example (response was fully truncated)
-            continue
-
-        batch_inputs.append({"input_ids": full_ids})
-        batch_meta.append((item["id"], resp_start, resp_end))
-
-        if len(batch_inputs) >= args.batch_size:
-            flush_batch()
-
-        if (idx + 1) % save_every == 0:
+        if (idx + 1) % (save_every // args.batch_size + 1) == 0:
             torch.save(results, args.output)
-            print(f"  checkpoint: {len(results)} examples saved to {args.output}")
-
-    # Final partial batch
-    flush_batch()
 
     torch.save(results, args.output)
-    print(f"\nDone. {len(results)} examples saved to {args.output}")
+    print(f"\nDone. {len(results)} examples saved.")
+
 
 
 if __name__ == "__main__":

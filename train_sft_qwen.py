@@ -86,8 +86,8 @@ def main():
         gradient_checkpointing=True,
         report_to="none",
         max_length=args.max_seq_length,
-        optim="adamw_torch_fused",
-        dataloader_num_workers=2,
+        optim="adamw_8bit",
+        dataloader_num_workers=0,
     )
 
     peft_config = LoraConfig(

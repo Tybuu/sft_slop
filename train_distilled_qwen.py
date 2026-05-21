@@ -14,8 +14,6 @@ cross-vocabulary mapping: teacher top-100 indices are used directly.
 
 import argparse
 import os
-# Restrict to a single GPU on Kaggle T4x2
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.nn.functional as F
@@ -32,23 +30,18 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
     SFTTrainer subclass that blends standard cross-entropy loss with a
     sparse KL-divergence loss computed from pre-cached teacher top-100 logits.
 
-    Teacher logits are keyed by example id and stored as:
-        top_probs:   Tensor[L, 100]  (FP16, already softmax'd)
-        top_indices: Tensor[L, 100]  (INT32 token indices, shared vocab)
-
-    The KL is computed only over the 100 non-zero teacher probability mass
-    positions, which is fast and retains ~95%+ of the full-distribution signal.
+    The KL is computed over the entire batch at once for efficiency.
     """
 
     def __init__(self, teacher_logits: dict, alpha: float = 0.5,
                  temp: float = 2.0, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.teacher_logits = teacher_logits  # id -> {top_probs, top_indices}
+        self.teacher_logits = teacher_logits
         self.alpha = alpha
         self.temp = temp
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # Pop the example id we injected via the collator; not a model input
+        # Pop the example id we injected via the collator
         example_ids = inputs.pop("example_id", None)
 
         # ── Student forward ──────────────────────────────────────────────────
@@ -59,10 +52,16 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
         if example_ids is None or self.teacher_logits is None:
             return (loss_ce, outputs) if return_outputs else loss_ce
 
-        # ── KL distillation over cached teacher top-100 ──────────────────────
+        # ── Vectorized KL distillation ──────────────────────────────────────
         labels = inputs.get("labels")
-        loss_kd_total = torch.tensor(0.0, device=student_logits.device)
-        valid_token_count = 0
+        if labels is None:
+            return (loss_ce, outputs) if return_outputs else loss_ce
+
+        batch_t_probs = []
+        batch_t_indices = []
+        batch_s_logits = []
+        
+        response_mask = (labels != -100) # (B, L)
 
         for b_idx, ex_id in enumerate(example_ids):
             ex_id_str = ex_id if isinstance(ex_id, str) else str(ex_id.item())
@@ -70,73 +69,46 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
                 continue
 
             t_data = self.teacher_logits[ex_id_str]
-            # top_probs / top_indices are FP16 / INT32 on CPU; move to GPU
-            top_probs   = t_data["top_probs"].to(
-                student_logits.device, dtype=torch.float32, non_blocking=True
-            )  # (L_t, 100)
-            top_indices = t_data["top_indices"].to(
-                student_logits.device, dtype=torch.long, non_blocking=True
-            )  # (L_t, 100)
+            t_probs = t_data["top_probs"]   # (L_t, 100)
+            t_indices = t_data["top_indices"] # (L_t, 100)
 
-            L_t = top_probs.size(0)
-            V   = student_logits.size(-1)
+            resp_positions = response_mask[b_idx].nonzero(as_tuple=True)[0]
+            n_aligned = min(t_probs.size(0), resp_positions.size(0))
 
-            # Determine which student positions correspond to response tokens
-            if labels is not None:
-                response_mask = (labels[b_idx] != -100)   # (L_student,)
-                resp_positions = response_mask.nonzero(as_tuple=True)[0]
-            else:
-                resp_positions = torch.arange(
-                    student_logits.size(1), device=student_logits.device
-                )
+            if n_aligned > 0:
+                batch_t_probs.append(t_probs[:n_aligned])
+                batch_t_indices.append(t_indices[:n_aligned])
+                batch_s_logits.append(student_logits[b_idx, resp_positions[:n_aligned]])
 
-            # Align: take the min of cached teacher length and unmasked positions
-            n_aligned = min(L_t, resp_positions.size(0))
-            if n_aligned == 0:
-                continue
+        if not batch_t_probs:
+            return (loss_ce, outputs) if return_outputs else loss_ce
 
-            resp_pos  = resp_positions[:n_aligned]           # (N,)
-            t_probs   = top_probs[:n_aligned]                 # (N, 100)
-            t_indices = top_indices[:n_aligned]               # (N, 100)
+        # Concatenate all response tokens from the batch
+        all_t_probs = torch.cat(batch_t_probs, dim=0).to(student_logits.device, non_blocking=True)
+        all_t_indices = torch.cat(batch_t_indices, dim=0).to(student_logits.device, dtype=torch.long, non_blocking=True)
+        all_s_logits = torch.cat(batch_s_logits, dim=0).float() # (Total_N, V)
 
-            # Apply temperature to teacher probs and re-normalise
-            # (top_probs were saved at temp=1; apply temp scaling here)
-            if self.temp != 1.0:
-                # log → scale → softmax (numerically stable)
-                t_log_scaled = torch.log(t_probs.clamp(min=1e-9)) / self.temp
-                t_probs = torch.softmax(t_log_scaled, dim=-1)
+        if self.temp != 1.0:
+            t_log_scaled = torch.log(all_t_probs.clamp(min=1e-9)) / self.temp
+            all_t_probs = torch.softmax(t_log_scaled, dim=-1)
 
-            # Student log-probs at response positions, temperature-scaled
-            s_logits = student_logits[b_idx, resp_pos, :].float()  # (N, V)
-            s_log_probs_full = F.log_softmax(s_logits / self.temp, dim=-1)  # (N, V)
+        s_log_probs_full = F.log_softmax(all_s_logits / self.temp, dim=-1)
+        
+        V = s_log_probs_full.size(-1)
+        all_t_indices_clamped = all_t_indices.clamp(0, V - 1)
+        s_log_probs_sparse = s_log_probs_full.gather(1, all_t_indices_clamped)
 
-            # Gather student log-probs at the 100 teacher positions
-            # Clamp indices to valid range (shared vocab, should be identical)
-            t_indices_clamped = t_indices.clamp(0, V - 1)          # (N, 100)
-            s_log_probs_sparse = s_log_probs_full.gather(
-                1, t_indices_clamped
-            )  # (N, 100)
+        # KL: Token-level average
+        loss_kd = F.kl_div(
+            s_log_probs_sparse,
+            all_t_probs,
+            reduction="batchmean",
+        ) * (self.temp ** 2)
 
-            # KL: sum_k  p_teacher_k * (log p_teacher_k - log p_student_k)
-            # = sum_k  t_probs_k * log(t_probs_k) - t_probs_k * s_log_probs_k
-            # Only the second term depends on student; first term is constant.
-            # F.kl_div expects log-input, non-log target.
-            kl = F.kl_div(
-                s_log_probs_sparse,
-                t_probs,
-                reduction="sum",
-            ) * (self.temp ** 2)
-
-            loss_kd_total += kl
-            valid_token_count += n_aligned
-
-        if valid_token_count > 0:
-            loss_kd = loss_kd_total / valid_token_count
-            loss = (1.0 - self.alpha) * loss_ce + self.alpha * loss_kd
-        else:
-            loss = loss_ce
+        loss = (1.0 - self.alpha) * loss_ce + self.alpha * loss_kd
 
         return (loss, outputs) if return_outputs else loss
+
 
 
 # ── Dataset helpers ───────────────────────────────────────────────────────────
@@ -264,7 +236,7 @@ def main():
         optim="adamw_8bit",
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        # Data loading
+        # Data loading (set to 0 for Kaggle stability)
         dataloader_num_workers=0,
         dataloader_pin_memory=True,
         # Disable packing so we preserve 'example_id' for teacher logits lookup
