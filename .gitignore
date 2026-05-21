@@ -1,0 +1,9 @@
+.envrc
+.direnv/
+.venv/
+__pycache__/
+*.pyc
+*.log
+t5-sft-*
+qwen-sft-*
+gpt2-distilled*

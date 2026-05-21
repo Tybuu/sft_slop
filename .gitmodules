@@ -1,0 +1,3 @@
+[submodule "sdft_repo"]
+	path = sdft_repo
+	url = https://github.com/idanshen/Self-Distillation.git
