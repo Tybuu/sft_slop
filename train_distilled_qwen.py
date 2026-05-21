@@ -14,6 +14,8 @@ cross-vocabulary mapping: teacher top-100 indices are used directly.
 
 import argparse
 import os
+# Restrict to a single GPU on Kaggle T4x2
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.nn.functional as F
@@ -263,10 +265,10 @@ def main():
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         # Data loading
-        dataloader_num_workers=4,
+        dataloader_num_workers=0,
         dataloader_pin_memory=True,
-        # Pack multiple short examples per window → less padding waste
-        packing=True,
+        # Disable packing so we preserve 'example_id' for teacher logits lookup
+        packing=False,
         max_length=args.max_seq_length,
         # Keep example_id column so compute_loss can look up teacher logits
         dataset_kwargs={"skip_prepare_dataset": False},

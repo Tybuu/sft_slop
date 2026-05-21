@@ -21,6 +21,8 @@ where L is the number of non-padding (non-prompt) response tokens.
 
 import argparse
 import os
+# Restrict to a single GPU on Kaggle T4x2
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 from tqdm import tqdm
@@ -67,6 +69,8 @@ def main():
                         help="Number of examples to process per GPU forward pass.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Truncate dataset (for testing).")
+    parser.add_argument("--compile", action="store_true",
+                        help="Compile the teacher model using torch.compile (can take a long time to start).")
     args = parser.parse_args()
 
     if args.output is None:
@@ -74,10 +78,7 @@ def main():
 
     # ── Device ──────────────────────────────────────────────────────────────
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # On a T4x2 Kaggle notebook put the teacher on GPU 1 to keep GPU 0
-    # free for the student during distillation.
-    if torch.cuda.device_count() > 1:
-        device = "cuda:1"
+    # Use only a single GPU (GPU 0) for teacher inference.
     print(f"Teacher will run on: {device}")
 
     # ── Load teacher ─────────────────────────────────────────────────────────
@@ -100,8 +101,9 @@ def main():
         p.requires_grad = False
 
     # Optional: compile teacher for faster repeated inference
-    print("Compiling teacher with torch.compile …")
-    teacher = torch.compile(teacher, mode="reduce-overhead", dynamic=True)
+    if args.compile:
+        print("Compiling teacher with torch.compile …")
+        teacher = torch.compile(teacher, mode="reduce-overhead", dynamic=True)
 
     # ── Load dataset ─────────────────────────────────────────────────────────
     print(f"Loading dataset: {args.dataset}")
