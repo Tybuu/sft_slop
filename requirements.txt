@@ -2,5 +2,6 @@ torch
 datasets
 trl
 accelerate
+torchao>=0.16.0
 git+https://github.com/huggingface/transformers.git
 git+https://github.com/huggingface/peft.git
