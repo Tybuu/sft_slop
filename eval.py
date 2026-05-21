@@ -1,6 +1,7 @@
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer
 from data_loader import load_sdft_dataset, format_prompt
+from peft import PeftModel
 import json
 from tqdm import tqdm
 import argparse
@@ -55,31 +56,46 @@ def extract_action_inputs(text):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="google/flan-t5-small")
+    parser.add_argument("--model_path", type=str, required=True, 
+                        help="Path to the model or LoRA adapter.")
+    parser.add_argument("--base_model", type=str, default="Qwen/Qwen3.5-0.8B",
+                        help="Base model for LoRA adapter.")
     parser.add_argument("--dataset", type=str, default="science")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max_tokens", type=int, default=256)
+    parser.add_argument("--max_tokens", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=1)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading model: {args.model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    
+    print(f"Loading tokenizer from {args.model_path} (or {args.base_model})")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    except:
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+        
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    print(f"Loading model: {args.base_model}")
+    # We load the base model first
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base_model,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+        device_map="auto",
+        attn_implementation="sdpa"
+    )
+
+    # If model_path is different from base_model, we assume it's a LoRA adapter
+    if args.model_path != args.base_model:
+        print(f"Loading LoRA adapter from {args.model_path}")
+        model = PeftModel.from_pretrained(model, args.model_path)
+        print("Merging LoRA weights for faster inference...")
+        model = model.merge_and_unload()
     
-    # Try to load as Seq2Seq, fallback to Causal
-    try:
-        model = AutoModelForSeq2SeqLM.from_pretrained(args.model_path).to(device)
-        is_seq2seq = True
-    except:
-        from transformers import BitsAndBytesConfig
-        quant_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path, 
-            quantization_config=quant_config,
-            device_map="auto"
-        )
-        is_seq2seq = False
+    model.eval()
 
     print(f"Loading evaluation data: {args.dataset}")
     eval_data = load_sdft_dataset(args.dataset, 'eval')
@@ -100,33 +116,30 @@ def main():
         prompt = format_prompt(item)
         target = item['target']
         
+        # Format with chat template if needed (optional, but keep it consistent with training)
+        # For now, keep the simple format_prompt from data_loader
+        
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536).to(device)
         
         with torch.no_grad():
-            if is_seq2seq:
-                outputs = model.generate(
-                    **inputs, 
-                    max_new_tokens=args.max_tokens, 
-                    do_sample=False,
-                    repetition_penalty=1.2,
-                    no_repeat_ngram_size=3
-                )
-                prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            else:
-                # For causal models, we need to handle the prompt being in the output
-                outputs = model.generate(
-                    **inputs, 
-                    max_new_tokens=args.max_tokens, 
-                    do_sample=False,
-                    repetition_penalty=1.2,
-                    no_repeat_ngram_size=3
-                )
-                full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            outputs = model.generate(
+                **inputs, 
+                max_new_tokens=args.max_tokens, 
+                do_sample=False,
+                repetition_penalty=1.1, # Slightly lower to avoid degrading Qwen
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Remove prompt
+            if full_text.startswith(prompt):
                 prediction = full_text[len(prompt):].strip()
+            else:
+                prediction = full_text.strip()
         
         if args.dataset == "science":
             extracted_pred = extract_xml_answer(prediction)
-            is_correct = (extracted_pred == target)
+            is_correct = (extracted_pred.lower() == target.lower())
         elif args.dataset == "tooluse":
             from collections import Counter
             pred_actions = extract_actions(prediction)
