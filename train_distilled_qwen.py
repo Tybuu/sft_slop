@@ -1,176 +1,249 @@
+"""
+train_distilled_qwen.py
+
+Trains Qwen/Qwen3.5-0.8B (student) using knowledge distillation from
+pre-computed top-100 teacher logits produced by generate_qwen_teacher_logits.py.
+
+Two-phase run on Kaggle T4x2:
+    1. python generate_qwen_teacher_logits.py --dataset tooluse
+    2. python train_distilled_qwen.py --dataset tooluse
+
+Because teacher and student share the same Qwen3.5 tokenizer there is no
+cross-vocabulary mapping: teacher top-100 indices are used directly.
+"""
+
 import argparse
 import os
+
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_from_disk
-from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
 
 
-class OnTheFlyDistillationTrainer(SFTTrainer):
-    def __init__(self, teacher_model, alpha=0.5, temp=2.0, *args, **kwargs):
+# ── Distillation trainer ─────────────────────────────────────────────────────
+
+class CachedLogitsDistillationTrainer(SFTTrainer):
+    """
+    SFTTrainer subclass that blends standard cross-entropy loss with a
+    sparse KL-divergence loss computed from pre-cached teacher top-100 logits.
+
+    Teacher logits are keyed by example id and stored as:
+        top_probs:   Tensor[L, 100]  (FP16, already softmax'd)
+        top_indices: Tensor[L, 100]  (INT32 token indices, shared vocab)
+
+    The KL is computed only over the 100 non-zero teacher probability mass
+    positions, which is fast and retains ~95%+ of the full-distribution signal.
+    """
+
+    def __init__(self, teacher_logits: dict, alpha: float = 0.5,
+                 temp: float = 2.0, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.teacher_model = teacher_model
+        self.teacher_logits = teacher_logits  # id -> {top_probs, top_indices}
         self.alpha = alpha
         self.temp = temp
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # ── 1. Student forward ──────────────────────────────────────────────
-        student_outputs = model(**inputs)
-        student_logits = student_outputs.logits   # (B, L, V_student)
-        loss_ce = student_outputs.loss
+        # Pop the example id we injected via the collator; not a model input
+        example_ids = inputs.pop("example_id", None)
 
-        # ── 2. Teacher forward (no grad, inference_mode for max speed) ──────
-        # non_blocking=True overlaps PCIe transfer with GPU work
-        teacher_inputs = {
-            k: v.to(self.teacher_model.device, non_blocking=True)
-            for k, v in inputs.items()
-        }
-        with torch.inference_mode():
-            teacher_outputs = self.teacher_model(**teacher_inputs)
-            # Move teacher logits back to student device; keep as FP16 to save BW
-            teacher_logits = teacher_outputs.logits.to(
-                student_logits.device, non_blocking=True
-            )
+        # ── Student forward ──────────────────────────────────────────────────
+        outputs = model(**inputs)
+        student_logits = outputs.logits   # (B, L, V)
+        loss_ce = outputs.loss
 
-        # ── 3. Full-vocab KL divergence on unmasked (non-padding) tokens ────
+        if example_ids is None or self.teacher_logits is None:
+            return (loss_ce, outputs) if return_outputs else loss_ce
+
+        # ── KL distillation over cached teacher top-100 ──────────────────────
         labels = inputs.get("labels")
-        if labels is not None:
-            mask = labels != -100                        # (B, L)
+        loss_kd_total = torch.tensor(0.0, device=student_logits.device)
+        valid_token_count = 0
 
-            s_logits_valid = student_logits[mask]        # (N, V_student)
-            t_logits_valid = teacher_logits[mask]        # (N, V_teacher)
+        for b_idx, ex_id in enumerate(example_ids):
+            ex_id_str = ex_id if isinstance(ex_id, str) else str(ex_id.item())
+            if ex_id_str not in self.teacher_logits:
+                continue
 
-            if s_logits_valid.numel() > 0:
-                # Truncate teacher vocab to student vocab size if needed
-                v_student = s_logits_valid.size(-1)
-                if t_logits_valid.size(-1) > v_student:
-                    t_logits_valid = t_logits_valid[..., :v_student]
+            t_data = self.teacher_logits[ex_id_str]
+            # top_probs / top_indices are FP16 / INT32 on CPU; move to GPU
+            top_probs   = t_data["top_probs"].to(
+                student_logits.device, dtype=torch.float32, non_blocking=True
+            )  # (L_t, 100)
+            top_indices = t_data["top_indices"].to(
+                student_logits.device, dtype=torch.long, non_blocking=True
+            )  # (L_t, 100)
 
-                # Compute softmax / log-softmax in fp32 for numerical stability
-                s_log_probs = F.log_softmax(
-                    s_logits_valid.float() / self.temp, dim=-1
-                )
-                t_probs = F.softmax(
-                    t_logits_valid.float() / self.temp, dim=-1
-                )
+            L_t = top_probs.size(0)
+            V   = student_logits.size(-1)
 
-                loss_kd = (
-                    F.kl_div(s_log_probs, t_probs, reduction="batchmean")
-                    * (self.temp ** 2)
-                )
-                loss = (1 - self.alpha) * loss_ce + self.alpha * loss_kd
+            # Determine which student positions correspond to response tokens
+            if labels is not None:
+                response_mask = (labels[b_idx] != -100)   # (L_student,)
+                resp_positions = response_mask.nonzero(as_tuple=True)[0]
             else:
-                loss = loss_ce
+                resp_positions = torch.arange(
+                    student_logits.size(1), device=student_logits.device
+                )
+
+            # Align: take the min of cached teacher length and unmasked positions
+            n_aligned = min(L_t, resp_positions.size(0))
+            if n_aligned == 0:
+                continue
+
+            resp_pos  = resp_positions[:n_aligned]           # (N,)
+            t_probs   = top_probs[:n_aligned]                 # (N, 100)
+            t_indices = top_indices[:n_aligned]               # (N, 100)
+
+            # Apply temperature to teacher probs and re-normalise
+            # (top_probs were saved at temp=1; apply temp scaling here)
+            if self.temp != 1.0:
+                # log → scale → softmax (numerically stable)
+                t_log_scaled = torch.log(t_probs.clamp(min=1e-9)) / self.temp
+                t_probs = torch.softmax(t_log_scaled, dim=-1)
+
+            # Student log-probs at response positions, temperature-scaled
+            s_logits = student_logits[b_idx, resp_pos, :].float()  # (N, V)
+            s_log_probs_full = F.log_softmax(s_logits / self.temp, dim=-1)  # (N, V)
+
+            # Gather student log-probs at the 100 teacher positions
+            # Clamp indices to valid range (shared vocab, should be identical)
+            t_indices_clamped = t_indices.clamp(0, V - 1)          # (N, 100)
+            s_log_probs_sparse = s_log_probs_full.gather(
+                1, t_indices_clamped
+            )  # (N, 100)
+
+            # KL: sum_k  p_teacher_k * (log p_teacher_k - log p_student_k)
+            # = sum_k  t_probs_k * log(t_probs_k) - t_probs_k * s_log_probs_k
+            # Only the second term depends on student; first term is constant.
+            # F.kl_div expects log-input, non-log target.
+            kl = F.kl_div(
+                s_log_probs_sparse,
+                t_probs,
+                reduction="sum",
+            ) * (self.temp ** 2)
+
+            loss_kd_total += kl
+            valid_token_count += n_aligned
+
+        if valid_token_count > 0:
+            loss_kd = loss_kd_total / valid_token_count
+            loss = (1.0 - self.alpha) * loss_ce + self.alpha * loss_kd
         else:
             loss = loss_ce
 
-        return (loss, student_outputs) if return_outputs else loss
+        return (loss, outputs) if return_outputs else loss
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="tooluse")
-    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-2B")
-    parser.add_argument("--student_model", type=str, default="Qwen/Qwen3.5-0.8B")
-    parser.add_argument("--output_dir", type=str, default="./qwen-distilled-tooluse")
-    parser.add_argument("--epochs", type=int, default=3)
-    # T4 has 16 GB VRAM; batch_size=2 with LoRA+gc fits comfortably
-    parser.add_argument("--batch_size", type=int, default=2)
-    # Keep effective batch = 16; halve grad_acc since batch doubled
-    parser.add_argument("--grad_acc", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
-    parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--temp", type=float, default=2.0)
-    # Compile teacher with torch.compile for CUDA graph / kernel fusion speedup
-    parser.add_argument("--compile_teacher", action="store_true", default=True)
-    args = parser.parse_args()
+# ── Dataset helpers ───────────────────────────────────────────────────────────
 
-    # ── Device assignments ──────────────────────────────────────────────────
-    num_gpus = torch.cuda.device_count()
-    teacher_device = "cuda:1" if num_gpus > 1 else "cuda:0"
-    student_device = "cuda:0"
-
-    # T4 does NOT support BF16; force FP16 explicitly
-    dtype = torch.float16
-
-    # ── Tokenizer ───────────────────────────────────────────────────────────
-    print(f"Loading tokenizer from {args.student_model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.student_model, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # ── Teacher model ────────────────────────────────────────────────────────
-    print(f"Loading Teacher ({args.teacher_model}) → {teacher_device} ...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    ).to(teacher_device)
-    teacher_model.eval()
-    for param in teacher_model.parameters():
-        param.requires_grad = False
-
-    # torch.compile fuses kernels and builds CUDA graphs; dynamic=True handles
-    # variable sequence lengths without recompilation storms.
-    if args.compile_teacher:
-        print("Compiling teacher with torch.compile (dynamic=True, reduce-overhead)...")
-        teacher_model = torch.compile(
-            teacher_model,
-            mode="reduce-overhead",
-            dynamic=True,
-        )
-
-    # ── Student model ─────────────────────────────────────────────────────────
-    print(f"Loading Student ({args.student_model}) → {student_device} ...")
-    student_model = AutoModelForCausalLM.from_pretrained(
-        args.student_model,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    ).to(student_device)
-
-    # ── Dataset ────────────────────────────────────────────────────────────
-    print(f"Loading dataset: {args.dataset}")
-    raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"
-    dataset = load_from_disk(raw_path)
-
+def build_formatted_dataset(raw_hf_dataset, dataset_name: str):
+    """Convert raw HF dataset rows into {messages, example_id} dicts."""
     from utils import format_target
 
-    def format_dataset(examples):
-        """Batched map: faster than per-example mapping."""
-        results = {"messages": []}
-        if args.dataset == "science":
-            for msgs, out in zip(examples["messages"], examples["output_text"]):
-                results["messages"].append([
+    def _format(examples):
+        out_messages = []
+        out_ids = []
+
+        if dataset_name == "science":
+            for i, (msgs, out) in enumerate(
+                zip(examples["messages"], examples["output_text"])
+            ):
+                out_messages.append([
                     {"role": "system",    "content": msgs[0]["content"]},
                     {"role": "user",      "content": msgs[1]["content"]},
                     {"role": "assistant", "content": out},
                 ])
-        elif args.dataset == "tooluse":
-            for prompt, golden in zip(examples["prompt"], examples["golden_response"]):
+                out_ids.append(f"science_train_{i}")
+
+        elif dataset_name == "tooluse":
+            for i, (prompt, golden) in enumerate(
+                zip(examples["prompt"], examples["golden_response"])
+            ):
                 target = format_target(golden[0])
-                results["messages"].append([
+                out_messages.append([
                     {"role": "system",    "content": "You are a helpful assistant."},
                     {"role": "user",      "content": prompt},
                     {"role": "assistant", "content": target},
                 ])
+                out_ids.append(f"tooluse_train_{i}")
         else:
-            raise ValueError(f"Dataset format not supported: {args.dataset}")
-        return results
+            raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-    formatted_dataset = dataset.map(
-        format_dataset,
-        batched=True,              # vectorised → much faster
+        return {"messages": out_messages, "example_id": out_ids}
+
+    return raw_hf_dataset.map(
+        _format,
+        batched=True,
         batch_size=256,
-        remove_columns=dataset.column_names,
-        num_proc=4,                # parallel CPU workers
+        remove_columns=raw_hf_dataset.column_names,
+        num_proc=4,
     )
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset",       type=str,   default="tooluse")
+    parser.add_argument("--student_model", type=str,   default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--logits_file",   type=str,   default=None,
+                        help="Path to .pt file from generate_qwen_teacher_logits.py. "
+                             "Defaults to teacher_logits_qwen_<dataset>.pt")
+    parser.add_argument("--output_dir",    type=str,   default="./qwen-distilled-tooluse")
+    parser.add_argument("--epochs",        type=int,   default=3)
+    parser.add_argument("--batch_size",    type=int,   default=2)
+    parser.add_argument("--grad_acc",      type=int,   default=8)
+    parser.add_argument("--lr",            type=float, default=5e-5)
+    parser.add_argument("--max_seq_length",type=int,   default=1024)
+    parser.add_argument("--alpha",         type=float, default=0.5,
+                        help="Weight of KD loss (0 = pure CE, 1 = pure KD).")
+    parser.add_argument("--temp",          type=float, default=2.0,
+                        help="Distillation temperature.")
+    args = parser.parse_args()
+
+    if args.logits_file is None:
+        args.logits_file = f"teacher_logits_qwen_{args.dataset}.pt"
+
+    # ── Load cached teacher logits ───────────────────────────────────────────
+    if not os.path.exists(args.logits_file):
+        raise FileNotFoundError(
+            f"Teacher logits file not found: {args.logits_file}\n"
+            f"Run generate_qwen_teacher_logits.py first."
+        )
+    print(f"Loading teacher logits from {args.logits_file} …")
+    logits_list = torch.load(args.logits_file, weights_only=False)
+    # Key by id for O(1) lookup in compute_loss
+    teacher_logits = {item["id"]: item for item in logits_list}
+    print(f"  {len(teacher_logits)} examples loaded.")
+
+    # ── Tokenizer ────────────────────────────────────────────────────────────
+    print(f"Loading tokenizer from {args.student_model}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.student_model, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # ── Student model ─────────────────────────────────────────────────────────
+    print(f"Loading student: {args.student_model}")
+    student_model = AutoModelForCausalLM.from_pretrained(
+        args.student_model,
+        torch_dtype=torch.float16,   # T4 is FP16-only (no BF16 support)
+        trust_remote_code=True,
+    )
+
+    # ── Dataset ──────────────────────────────────────────────────────────────
+    print(f"Loading dataset: {args.dataset}")
+    raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"
+    raw_dataset = load_from_disk(raw_path)
+    formatted_dataset = build_formatted_dataset(raw_dataset, args.dataset)
     print(f"Formatted dataset: {len(formatted_dataset)} examples")
 
-    # ── Training config ──────────────────────────────────────────────────
+    # ── Training config ───────────────────────────────────────────────────────
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -179,42 +252,44 @@ def main():
         learning_rate=args.lr,
         weight_decay=0.01,
         warmup_ratio=0.05,
-        # Force FP16 — T4 has no BF16 hardware support
+        # T4 has no BF16 hardware support
         bf16=False,
         fp16=True,
         logging_steps=10,
         save_strategy="epoch",
-        save_total_limit=1,           # keep only the latest checkpoint
-        # 8-bit Adam: halves optimizer state memory (~2 GB saved on T4)
+        save_total_limit=1,
+        # 8-bit Adam halves optimizer-state memory (~2 GB saved)
         optim="adamw_8bit",
         gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},  # required for LoRA
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         # Data loading
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
-        # Pack multiple short examples per sequence → less padding waste
+        # Pack multiple short examples per window → less padding waste
         packing=True,
         max_length=args.max_seq_length,
+        # Keep example_id column so compute_loss can look up teacher logits
+        dataset_kwargs={"skip_prepare_dataset": False},
+        remove_unused_columns=False,
         report_to="none",
     )
 
-    # ── LoRA config ──────────────────────────────────────────────────────
-    # Expand to all linear projections for better gradient flow
+    # ── LoRA ──────────────────────────────────────────────────────────────────
     peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",   # MLP projections
+            "gate_proj", "up_proj", "down_proj",
         ],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
     )
 
-    # ── Trainer ──────────────────────────────────────────────────────────
-    trainer = OnTheFlyDistillationTrainer(
-        teacher_model=teacher_model,
+    # ── Trainer ───────────────────────────────────────────────────────────────
+    trainer = CachedLogitsDistillationTrainer(
+        teacher_logits=teacher_logits,
         alpha=args.alpha,
         temp=args.temp,
         model=student_model,
@@ -224,7 +299,7 @@ def main():
         peft_config=peft_config,
     )
 
-    print("Starting Dual-GPU On-The-Fly Distillation...")
+    print("Starting distillation training …")
     trainer.train()
 
     print(f"Saving model to {args.output_dir}")
