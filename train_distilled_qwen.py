@@ -78,9 +78,13 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
             n_aligned = min(t_probs.size(0), resp_positions.size(0))
 
             if n_aligned > 0:
+                # IMPORTANT: Alignment fix. 
+                # student_logits[i] predicts token at i+1.
+                # Teacher saved logits[resp_start-1] to predict the first token.
+                # So we match teacher[0] with student_logits[resp_positions[0] - 1].
                 batch_t_probs.append(t_probs[:n_aligned])
                 batch_t_indices.append(t_indices[:n_aligned])
-                batch_s_logits.append(student_logits[b_idx, resp_positions[:n_aligned]])
+                batch_s_logits.append(student_logits[b_idx, resp_positions[:n_aligned] - 1])
 
         if not batch_t_probs:
             return (loss_ce, outputs) if return_outputs else loss_ce
@@ -91,11 +95,9 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
         all_s_logits = torch.cat(batch_s_logits, dim=0).float() # (Total_N, V)
 
         # Apply temperature and compute sparse log-probs efficiently
-        # log_probs(i) = (logits(i)/T) - log(sum(exp(logits(j)/T)))
         s_logits_scaled = all_s_logits / self.temp
         
-        # logsumexp over vocab is memory-hungry; compute it carefully
-        # This avoids creating the full [Total_N, Vocab] log_softmax tensor
+        # logsumexp over vocab is memory-hungry but stable
         lse = torch.logsumexp(s_logits_scaled, dim=-1, keepdim=True) # (Total_N, 1)
         
         V = s_logits_scaled.size(-1)
@@ -104,6 +106,9 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
         # Gather ONLY the logits the teacher had high probabilities for
         s_logits_sparse = s_logits_scaled.gather(1, all_t_indices_clamped) # (Total_N, 100)
         s_log_probs_sparse = s_logits_sparse - lse # (Total_N, 100)
+        
+        # Numerical stability: prevent extreme negative log-probs from exploding gradients in FP16
+        s_log_probs_sparse = s_log_probs_sparse.clamp(min=-50.0)
 
         if self.temp != 1.0:
             t_log_scaled = torch.log(all_t_probs.clamp(min=1e-9)) / self.temp
