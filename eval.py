@@ -63,10 +63,11 @@ def main():
     parser.add_argument("--dataset", type=str, default="science")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--max_tokens", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=1)
     args = parser.parse_args()
 
+    # Force single GPU for evaluation of small models to avoid communication overhead/offloading
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Evaluating on: {device}")
     
     print(f"Loading tokenizer from {args.model_path} (or {args.base_model})")
     try:
@@ -79,14 +80,14 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     print(f"Loading model: {args.base_model}")
-    # We load the base model first
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=torch.float16,
         trust_remote_code=True,
-        device_map="auto",
+        # Don't use device_map="auto" for 0.8B - it often offloads to CPU incorrectly
+        # We will move it manually to ensure it's on the GPU
         attn_implementation="sdpa"
-    )
+    ).to(device)
 
     # If model_path is different from base_model, we assume it's a LoRA adapter
     if args.model_path != args.base_model:
@@ -94,8 +95,10 @@ def main():
         model = PeftModel.from_pretrained(model, args.model_path)
         print("Merging LoRA weights for faster inference...")
         model = model.merge_and_unload()
+        model = model.to(device) # Re-ensure it's on GPU after merge
     
     model.eval()
+    print(f"Model is on: {model.device}")
 
     print(f"Loading evaluation data: {args.dataset}")
     eval_data = load_sdft_dataset(args.dataset, 'eval')
