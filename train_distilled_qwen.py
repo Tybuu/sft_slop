@@ -173,7 +173,7 @@ def main():
     parser.add_argument("--grad_acc",      type=int,   default=8)
     parser.add_argument("--lr",            type=float, default=5e-5)
     parser.add_argument("--max_seq_length",type=int,   default=1024)
-    parser.add_argument("--alpha",         type=float, default=0.5,
+    parser.add_argument("--alpha",         type=float, default=0.8,
                         help="Weight of KD loss (0 = pure CE, 1 = pure KD).")
     parser.add_argument("--temp",          type=float, default=2.0,
                         help="Distillation temperature.")
@@ -257,8 +257,8 @@ def main():
 
     # ── LoRA ──────────────────────────────────────────────────────────────────
     peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
+        r=64,
+        lora_alpha=128,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
