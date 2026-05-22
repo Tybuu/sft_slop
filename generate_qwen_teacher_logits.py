@@ -21,6 +21,8 @@ where L is the number of non-padding (non-prompt) response tokens.
 
 import argparse
 import os
+# Restrict to a single GPU for maximum speed on small models
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 from tqdm import tqdm

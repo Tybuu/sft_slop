@@ -8,6 +8,9 @@ import argparse
 import re
 import os
 
+# Restrict to a single GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 def extract_xml_answer(text: str) -> str:
     """Extract answer from XML-formatted text."""
     # Look for <answer>...</answer>

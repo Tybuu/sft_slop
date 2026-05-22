@@ -1,5 +1,8 @@
 import argparse
 import os
+# Restrict to a single GPU for maximum speed on small models
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 from datasets import load_from_disk

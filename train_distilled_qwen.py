@@ -14,6 +14,8 @@ cross-vocabulary mapping: teacher top-100 indices are used directly.
 
 import argparse
 import os
+# Restrict to a single GPU for maximum speed on small models
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.nn.functional as F
