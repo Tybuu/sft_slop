@@ -63,9 +63,11 @@ def main():
     parser.add_argument("--dataset", type=str, default="science")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--max_tokens", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Batch size for evaluation.")
     args = parser.parse_args()
 
-    # Force single GPU for evaluation of small models to avoid communication overhead/offloading
+    # Force single GPU for evaluation of small models
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Evaluating on: {device}")
     
@@ -75,6 +77,8 @@ def main():
     except:
         tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
         
+    # Causal LM batching needs left-padding
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -84,8 +88,6 @@ def main():
         args.base_model,
         torch_dtype=torch.float16,
         trust_remote_code=True,
-        # Don't use device_map="auto" for 0.8B - it often offloads to CPU incorrectly
-        # We will move it manually to ensure it's on the GPU
         attn_implementation="sdpa"
     ).to(device)
 
@@ -95,7 +97,7 @@ def main():
         model = PeftModel.from_pretrained(model, args.model_path)
         print("Merging LoRA weights for faster inference...")
         model = model.merge_and_unload()
-        model = model.to(device) # Re-ensure it's on GPU after merge
+        model = model.to(device)
     
     model.eval()
     print(f"Model is on: {model.device}")
@@ -114,74 +116,97 @@ def main():
     results = []
     correct = 0
 
-    print("Running evaluation...")
-    for i, item in enumerate(tqdm(eval_data)):
-        prompt = format_prompt(item)
-        target = item['target']
+    print("Running evaluation (batch_size={args.batch_size}) ...")
+    
+    # Process in batches
+    for i in tqdm(range(0, len(eval_data), args.batch_size)):
+        batch_items = eval_data[i : i + args.batch_size]
         
-        # Format with chat template if needed (optional, but keep it consistent with training)
-        # For now, keep the simple format_prompt from data_loader
+        # Apply chat template to each prompt in the batch
+        formatted_prompts = []
+        for item in batch_items:
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": format_prompt(item)}
+            ]
+            formatted_prompts.append(
+                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            )
         
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536).to(device)
+        inputs = tokenizer(
+            formatted_prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=1536
+        ).to(device)
         
         with torch.no_grad():
             outputs = model.generate(
                 **inputs, 
                 max_new_tokens=args.max_tokens, 
                 do_sample=False,
-                repetition_penalty=1.1, # Slightly lower to avoid degrading Qwen
+                repetition_penalty=1.1,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                # Stop if it tries to start a new turn
+                stop_strings=["<|im_start|>", "<|im_end|>", "User:", "Question:"],
+                tokenizer=tokenizer
             )
-            full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # Remove prompt
-            if full_text.startswith(prompt):
-                prediction = full_text[len(prompt):].strip()
-            else:
-                prediction = full_text.strip()
-        
-        if args.dataset == "science":
-            extracted_pred = extract_xml_answer(prediction)
-            is_correct = (extracted_pred.lower() == target.lower())
-        elif args.dataset == "tooluse":
-            from collections import Counter
-            pred_actions = extract_actions(prediction)
-            pred_inputs = extract_action_inputs(prediction)
             
-            # Use raw_eval_ds for golden_answer
-            golden_answer = raw_eval_ds[i]['golden_answer']
-            gt_actions = [ga['Action'] for ga in golden_answer]
+            input_len = inputs.input_ids.shape[1]
+            generated_ids = outputs[:, input_len:]
+            batch_predictions = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
             
-            # Merge all ground truth inputs and filter out empty strings for lenient comparison
-            gt_inputs = {}
-            for ga in golden_answer:
-                try:
-                    loaded = json.loads(ga['Action_Input'])
-                    # Only keep non-empty string values for comparison
-                    filtered_loaded = {k: v for k, v in loaded.items() if v != "" and v is not None}
-                    gt_inputs.update(filtered_loaded)
-                except:
-                    pass
+        for j, prediction in enumerate(batch_predictions):
+            # Clean up: stop at the first sign of looping or redundant content
+            # Most tool-use evaluations only care about the first action sequence
+            clean_prediction = prediction.split("Question:")[0].split("User:")[0].strip()
             
-            # Filter predicted inputs too
-            filtered_pred_inputs = {k: v for k, v in pred_inputs.items() if v != "" and v is not None}
+            item = batch_items[j]
+            target = item['target']
+            item_idx = i + j
             
-            actions_match = Counter(pred_actions) == Counter(gt_actions)
-            inputs_match = filtered_pred_inputs == gt_inputs
-            is_correct = actions_match and inputs_match
-            extracted_pred = f"Actions: {pred_actions}, Inputs: {pred_inputs}"
-        
-        if is_correct:
-            correct += 1
+            if args.dataset == "science":
+                extracted_pred = extract_xml_answer(clean_prediction)
+                is_correct = (extracted_pred.lower() == target.lower())
+            elif args.dataset == "tooluse":
+                from collections import Counter
+                pred_actions = extract_actions(clean_prediction)
+                pred_inputs = extract_action_inputs(clean_prediction)
+                
+                # Use raw_eval_ds for golden_answer
+                golden_answer = raw_eval_ds[item_idx]['golden_answer']
+                gt_actions = [ga['Action'] for ga in golden_answer]
+                
+                gt_inputs = {}
+                for ga in golden_answer:
+                    try:
+                        loaded = json.loads(ga['Action_Input'])
+                        filtered_loaded = {k: v for k, v in loaded.items() if v != "" and v is not None}
+                        gt_inputs.update(filtered_loaded)
+                    except:
+                        pass
+                
+                filtered_pred_inputs = {k: v for k, v in pred_inputs.items() if v != "" and v is not None}
+                
+                # Check accuracy: actions must match, and inputs must match
+                actions_match = Counter(pred_actions) == Counter(gt_actions)
+                inputs_match = filtered_pred_inputs == gt_inputs
+                is_correct = actions_match and inputs_match
+                extracted_pred = f"Actions: {pred_actions}, Inputs: {pred_inputs}"
             
-        results.append({
-            'id': item['id'],
-            'prompt': prompt,
-            'target': target,
-            'prediction': prediction,
-            'extracted_pred': extracted_pred,
-            'correct': is_correct
-        })
+            if is_correct:
+                correct += 1
+                
+            results.append({
+                'id': item['id'],
+                'prompt': batch_items[j]['input'],
+                'target': target,
+                'prediction': clean_prediction,
+                'extracted_pred': extracted_pred,
+                'correct': is_correct
+            })
 
     accuracy = correct / len(eval_data) if eval_data else 0
     print(f"\nResults for {args.model_path} on {args.dataset}:")
