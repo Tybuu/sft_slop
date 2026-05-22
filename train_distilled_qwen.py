@@ -88,15 +88,24 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
         all_t_indices = torch.cat(batch_t_indices, dim=0).to(student_logits.device, dtype=torch.long, non_blocking=True)
         all_s_logits = torch.cat(batch_s_logits, dim=0).float() # (Total_N, V)
 
+        # Apply temperature and compute sparse log-probs efficiently
+        # log_probs(i) = (logits(i)/T) - log(sum(exp(logits(j)/T)))
+        s_logits_scaled = all_s_logits / self.temp
+        
+        # logsumexp over vocab is memory-hungry; compute it carefully
+        # This avoids creating the full [Total_N, Vocab] log_softmax tensor
+        lse = torch.logsumexp(s_logits_scaled, dim=-1, keepdim=True) # (Total_N, 1)
+        
+        V = s_logits_scaled.size(-1)
+        all_t_indices_clamped = all_t_indices.clamp(0, V - 1)
+        
+        # Gather ONLY the logits the teacher had high probabilities for
+        s_logits_sparse = s_logits_scaled.gather(1, all_t_indices_clamped) # (Total_N, 100)
+        s_log_probs_sparse = s_logits_sparse - lse # (Total_N, 100)
+
         if self.temp != 1.0:
             t_log_scaled = torch.log(all_t_probs.clamp(min=1e-9)) / self.temp
             all_t_probs = torch.softmax(t_log_scaled, dim=-1)
-
-        s_log_probs_full = F.log_softmax(all_s_logits / self.temp, dim=-1)
-        
-        V = s_log_probs_full.size(-1)
-        all_t_indices_clamped = all_t_indices.clamp(0, V - 1)
-        s_log_probs_sparse = s_log_probs_full.gather(1, all_t_indices_clamped)
 
         # KL: Token-level average
         loss_kd = F.kl_div(
@@ -169,8 +178,8 @@ def main():
                              "Defaults to teacher_logits_qwen_<dataset>.pt")
     parser.add_argument("--output_dir",    type=str,   default="./qwen-distilled-tooluse")
     parser.add_argument("--epochs",        type=int,   default=3)
-    parser.add_argument("--batch_size",    type=int,   default=2)
-    parser.add_argument("--grad_acc",      type=int,   default=8)
+    parser.add_argument("--batch_size",    type=int,   default=1)
+    parser.add_argument("--grad_acc",      type=int,   default=16)
     parser.add_argument("--lr",            type=float, default=5e-5)
     parser.add_argument("--max_seq_length",type=int,   default=1024)
     parser.add_argument("--alpha",         type=float, default=0.8,
@@ -191,7 +200,7 @@ def main():
             f"Run generate_qwen_teacher_logits.py first."
         )
     print(f"Loading teacher logits from {args.logits_file} …")
-    logits_list = torch.load(args.logits_file, weights_only=False)
+    logits_list = torch.load(args.logits_file, map_location="cpu", weights_only=False)
     print(f"  Raw logits loaded. Converting to dictionary …")
     # Key by id for O(1) lookup in compute_loss
     teacher_logits = {item["id"]: item for item in logits_list}
