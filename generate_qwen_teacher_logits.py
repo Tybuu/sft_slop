@@ -21,8 +21,9 @@ where L is the number of non-padding (non-prompt) response tokens.
 
 import argparse
 import os
-# Restrict to a single GPU for maximum speed on small models
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Restrict to a single GPU by default, but allow user override via environment variable
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 from tqdm import tqdm
@@ -33,6 +34,51 @@ from data_loader import load_sdft_dataset, format_prompt
 from utils import format_target
 
 TOP_K = 100
+
+class TeacherWithTopK(torch.nn.Module):
+    """
+    Wrapper module to compute softmax and top-k on each GPU locally.
+    This prevents gathering the massive (B, L, V) logits tensor back to GPU 0,
+    which causes out-of-memory (OOM) errors and severe communication overhead.
+    """
+    def __init__(self, model, top_k=TOP_K):
+        super().__init__()
+        self.model = model
+        self.top_k = top_k
+
+    def forward(self, input_ids, attention_mask):
+        # Disable cache to optimize memory during full-sequence forward pass
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        logits = outputs.logits # (B, L, V)
+        probs = torch.softmax(logits.float(), dim=-1)
+        top_probs, top_indices = torch.topk(probs, self.top_k, dim=-1)
+        return top_probs.half(), top_indices.to(torch.int32)
+
+def build_example_inputs(tokenizer, prompt: str, response: str, max_length: int):
+    """
+    Tokenize using the Qwen chat template to match SFT training.
+    """
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": response}
+    ]
+    
+    # We need to find where the assistant response starts
+    # Get prompt-only tokens
+    prompt_msgs = messages[:-1]
+    prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True)
+    
+    # Get full tokens
+    full_ids = tokenizer.apply_chat_template(messages)
+    
+    if len(full_ids) > max_length:
+        full_ids = full_ids[:max_length]
+
+    resp_start = len(prompt_ids)
+    resp_end = min(len(full_ids), max_length)
+    
+    return full_ids, resp_start, resp_end
 
 class LogitDataset(Dataset):
     def __init__(self, data, tokenizer, dataset_name, max_length):
@@ -52,15 +98,9 @@ class LogitDataset(Dataset):
         else:
             response = item["target"]
 
-        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        response_ids = self.tokenizer(response, add_special_tokens=False)["input_ids"]
-
-        full_ids = prompt_ids + response_ids
-        if len(full_ids) > self.max_length:
-            full_ids = full_ids[:self.max_length]
-
-        resp_start = len(prompt_ids)
-        resp_end = min(len(prompt_ids) + len(response_ids), self.max_length)
+        full_ids, resp_start, resp_end = build_example_inputs(
+            self.tokenizer, prompt, response, self.max_length
+        )
         
         return {
             "id": item["id"],
@@ -140,6 +180,9 @@ def main():
     ).to(device)
     teacher.eval()
     
+    # Wrap model to compute top-K probabilities locally on each GPU
+    teacher = TeacherWithTopK(teacher, TOP_K)
+    
     if torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
         teacher = torch.nn.DataParallel(teacher)
@@ -179,8 +222,8 @@ def main():
         attention_mask = batch["attention_mask"].to(device)
         
         with torch.inference_mode():
-            outputs = teacher(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits # (B, L, V)
+            # Wrapper returns top_probs and top_indices directly
+            top_probs, top_indices = teacher(input_ids=input_ids, attention_mask=attention_mask)
 
         max_len = batch["max_len"]
         for i in range(len(batch["ids"])):
@@ -196,14 +239,14 @@ def main():
             if first_logit_idx < 0 or last_logit_idx <= first_logit_idx:
                 continue
 
-            resp_logits = logits[i, first_logit_idx:last_logit_idx, :]
-            probs = torch.softmax(resp_logits.float(), dim=-1)
-            top_probs, top_indices = torch.topk(probs, TOP_K, dim=-1)
+            # Slice from pre-computed top_probs and top_indices
+            example_top_probs = top_probs[i, first_logit_idx:last_logit_idx, :]
+            example_top_indices = top_indices[i, first_logit_idx:last_logit_idx, :]
 
             results.append({
                 "id":          example_id,
-                "top_probs":   top_probs.cpu().half(),
-                "top_indices": top_indices.cpu().to(torch.int32),
+                "top_probs":   example_top_probs.cpu(),
+                "top_indices": example_top_indices.cpu(),
             })
 
         if (idx + 1) % (save_every // args.batch_size + 1) == 0:
@@ -211,7 +254,6 @@ def main():
 
     torch.save(results, args.output)
     print(f"\nDone. {len(results)} examples saved.")
-
 
 
 if __name__ == "__main__":

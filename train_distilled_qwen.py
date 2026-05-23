@@ -14,8 +14,9 @@ cross-vocabulary mapping: teacher top-100 indices are used directly.
 
 import argparse
 import os
-# Restrict to a single GPU for maximum speed on small models
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Restrict to a single GPU for maximum speed on small models by default, but allow override
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,29 @@ from datasets import load_from_disk
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
+
+
+# ── Data Collator Wrapper ───────────────────────────────────────────────────
+
+class DistillationDataCollator:
+    """
+    Wrapper data collator to preserve 'example_id' through batching.
+    The base collator (DataCollatorForSeq2Seq) only handles model input fields,
+    so we extract 'example_id', clean the features, batch them, and re-inject.
+    """
+    def __init__(self, base_collator):
+        self.base_collator = base_collator
+
+    def __call__(self, features):
+        example_ids = [f.get("example_id") for f in features]
+        # Remove example_id from features so the base collator only sees model inputs
+        cleaned_features = [
+            {k: v for k, v in f.items() if k != "example_id"}
+            for f in features
+        ]
+        batch = self.base_collator(cleaned_features)
+        batch["example_id"] = example_ids
+        return batch
 
 
 # ── Distillation trainer ─────────────────────────────────────────────────────
@@ -41,6 +65,8 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
         self.teacher_logits = teacher_logits
         self.alpha = alpha
         self.temp = temp
+        # Wrap the default data collator to preserve example_id
+        self.data_collator = DistillationDataCollator(self.data_collator)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # Pop the example id we injected via the collator
@@ -110,9 +136,14 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
         # Numerical stability: prevent extreme negative log-probs from exploding gradients in FP16
         s_log_probs_sparse = s_log_probs_sparse.clamp(min=-50.0)
 
+        # Ensure all_t_probs is strictly positive to prevent NaNs in F.kl_div (e.g. from float16 underflow to 0.0)
+        all_t_probs = all_t_probs.clamp(min=1e-9)
         if self.temp != 1.0:
-            t_log_scaled = torch.log(all_t_probs.clamp(min=1e-9)) / self.temp
+            t_log_scaled = torch.log(all_t_probs) / self.temp
             all_t_probs = torch.softmax(t_log_scaled, dim=-1)
+        else:
+            # Normalize to sum to 1 over the top-K dimension
+            all_t_probs = all_t_probs / all_t_probs.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
         # KL: Token-level average
         loss_kd = F.kl_div(
@@ -121,7 +152,12 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
             reduction="batchmean",
         ) * (self.temp ** 2)
 
+        # Final loss weighting
         loss = (1.0 - self.alpha) * loss_ce + self.alpha * loss_kd
+
+        # Check for invalid loss values to prevent NaNs
+        if torch.isnan(loss) or torch.isinf(loss):
+            return loss_ce 
 
         return (loss, outputs) if return_outputs else loss
 
@@ -129,48 +165,64 @@ class CachedLogitsDistillationTrainer(SFTTrainer):
 
 # ── Dataset helpers ───────────────────────────────────────────────────────────
 
-def build_formatted_dataset(raw_hf_dataset, dataset_name: str):
-    """Convert raw HF dataset rows into {messages, example_id} dicts."""
+def prepare_distillation_dataset(raw_hf_dataset, dataset_name: str, tokenizer, max_length: int):
+    """
+    Format, tokenize and prepare the dataset for SFT distillation.
+    By doing tokenization manually and setting skip_prepare_dataset=True,
+    we prevent SFTTrainer from discarding the 'example_id' column during its
+    internal tokenization and column removal step.
+    """
     from utils import format_target
 
-    def _format(examples):
-        out_messages = []
-        out_ids = []
-
+    def _tokenize_and_align(example, idx):
         if dataset_name == "science":
-            for i, (msgs, out) in enumerate(
-                zip(examples["messages"], examples["output_text"])
-            ):
-                out_messages.append([
-                    {"role": "system",    "content": msgs[0]["content"]},
-                    {"role": "user",      "content": msgs[1]["content"]},
-                    {"role": "assistant", "content": out},
-                ])
-                out_ids.append(f"science_train_{i}")
-
+            messages = [
+                {"role": "system",    "content": example["messages"][0]["content"]},
+                {"role": "user",      "content": example["messages"][1]["content"]},
+                {"role": "assistant", "content": example["output_text"]},
+            ]
+            example_id = f"science_train_{idx}"
         elif dataset_name == "tooluse":
-            for i, (prompt, golden) in enumerate(
-                zip(examples["prompt"], examples["golden_response"])
-            ):
-                target = format_target(golden[0])
-                out_messages.append([
-                    {"role": "system",    "content": "You are a helpful assistant."},
-                    {"role": "user",      "content": prompt},
-                    {"role": "assistant", "content": target},
-                ])
-                out_ids.append(f"tooluse_train_{i}")
+            target = format_target(example["golden_response"][0])
+            messages = [
+                {"role": "system",    "content": "You are a helpful assistant."},
+                {"role": "user",      "content": example["prompt"]},
+                {"role": "assistant", "content": target},
+            ]
+            example_id = f"tooluse_train_{idx}"
         else:
             raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-        return {"messages": out_messages, "example_id": out_ids}
+        # Apply chat template
+        prompt_msgs = messages[:-1]
+        prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True)
+        full_ids = tokenizer.apply_chat_template(messages)
 
-    print(f"Mapping dataset (num_proc=1 for stability) …")
+        # Truncate
+        if len(full_ids) > max_length:
+            full_ids = full_ids[:max_length]
+
+        resp_start = len(prompt_ids)
+        resp_end = min(len(full_ids), max_length)
+
+        # Create labels: -100 for prompt, token_id for response
+        labels = [-100] * len(full_ids)
+        for i in range(resp_start, resp_end):
+            labels[i] = full_ids[i]
+
+        return {
+            "input_ids": full_ids,
+            "attention_mask": [1] * len(full_ids),
+            "labels": labels,
+            "example_id": example_id
+        }
+
+    print(f"Tokenizing and preparing dataset (num_proc=1 for stability) …")
     return raw_hf_dataset.map(
-        _format,
-        batched=True,
-        batch_size=256,
+        _tokenize_and_align,
+        with_indices=True,
         remove_columns=raw_hf_dataset.column_names,
-        num_proc=1, # Multiprocessing often hangs on Kaggle/Colab
+        num_proc=1,
     )
 
 
@@ -237,7 +289,9 @@ def main():
     print(f"Loading dataset: {args.dataset}")
     raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"
     raw_dataset = load_from_disk(raw_path)
-    formatted_dataset = build_formatted_dataset(raw_dataset, args.dataset)
+    formatted_dataset = prepare_distillation_dataset(
+        raw_dataset, args.dataset, tokenizer, args.max_seq_length
+    )
     print(f"Formatted dataset: {len(formatted_dataset)} examples")
 
     # ── Training config ───────────────────────────────────────────────────────
@@ -249,6 +303,7 @@ def main():
         learning_rate=args.lr,
         weight_decay=0.01,
         warmup_ratio=0.05,
+        max_grad_norm=1.0,
         # T4 has no BF16 hardware support
         bf16=False,
         fp16=True,
@@ -265,8 +320,8 @@ def main():
         # Disable packing so we preserve 'example_id' for teacher logits lookup
         packing=False,
         max_length=args.max_seq_length,
-        # Keep example_id column so compute_loss can look up teacher logits
-        dataset_kwargs={"skip_prepare_dataset": False},
+        # Tell SFTTrainer to skip its own preparation and tokenization as we did it pre-collated
+        dataset_kwargs={"skip_prepare_dataset": True},
         remove_unused_columns=False,
         report_to="none",
     )
