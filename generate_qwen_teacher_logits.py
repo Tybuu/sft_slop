@@ -104,32 +104,30 @@ def build_example_inputs(tokenizer, prompt: str, response: str, max_length: int)
 
 class LogitDataset(Dataset):
     def __init__(self, data, tokenizer, dataset_name, max_length):
-        self.data = data
-        self.tokenizer = tokenizer
-        self.dataset_name = dataset_name
-        self.max_length = max_length
+        self.features = []
+        print(f"Pre-tokenizing dataset (size: {len(data)}) to prevent CPU bottlenecks...")
+        for item in tqdm(data, desc="Tokenizing"):
+            prompt = format_prompt(item)
+            if dataset_name == "tooluse":
+                response = format_target(item["target"])
+            else:
+                response = item["target"]
+
+            full_ids, resp_start, resp_end = build_example_inputs(
+                tokenizer, prompt, response, max_length
+            )
+            self.features.append({
+                "id": item["id"],
+                "input_ids": full_ids,
+                "resp_start": resp_start,
+                "resp_end": resp_end
+            })
 
     def __len__(self):
-        return len(self.data)
+        return len(self.features)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        prompt = format_prompt(item)
-        if self.dataset_name == "tooluse":
-            response = format_target(item["target"])
-        else:
-            response = item["target"]
-
-        full_ids, resp_start, resp_end = build_example_inputs(
-            self.tokenizer, prompt, response, self.max_length
-        )
-        
-        return {
-            "id": item["id"],
-            "input_ids": full_ids,
-            "resp_start": resp_start,
-            "resp_end": resp_end
-        }
+        return self.features[idx]
 
 def collate_fn(batch, tokenizer):
     max_len = max(len(ex["input_ids"]) for ex in batch)
