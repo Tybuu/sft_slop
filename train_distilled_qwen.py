@@ -198,6 +198,23 @@ def prepare_distillation_dataset(raw_hf_dataset, dataset_name: str, tokenizer, m
         prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True)
         full_ids = tokenizer.apply_chat_template(messages)
 
+        # Handle BatchEncoding or dict return types from apply_chat_template
+        if hasattr(prompt_ids, "input_ids"):
+            prompt_ids = prompt_ids.input_ids
+        elif isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
+            prompt_ids = prompt_ids["input_ids"]
+            
+        if hasattr(full_ids, "input_ids"):
+            full_ids = full_ids.input_ids
+        elif isinstance(full_ids, dict) and "input_ids" in full_ids:
+            full_ids = full_ids["input_ids"]
+
+        # Convert tensors to list if needed
+        if hasattr(prompt_ids, "tolist"):
+            prompt_ids = prompt_ids.tolist()
+        if hasattr(full_ids, "tolist"):
+            full_ids = full_ids.tolist()
+
         # Truncate
         if len(full_ids) > max_length:
             full_ids = full_ids[:max_length]
