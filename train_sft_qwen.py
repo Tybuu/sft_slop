@@ -15,10 +15,10 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_acc", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--grad_acc", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     args = parser.parse_args()
 
@@ -33,13 +33,14 @@ def main():
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16
+        bnb_4bit_compute_dtype=torch.float16 # Compute in FP16 for T4
     )
 
-    print(f"Loading model (4-bit): {args.model_path}")
+    print(f"Loading model (4-bit FP16): {args.model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         quantization_config=bnb_config,
+        torch_dtype=torch.float16, # Force non-quantized layers to FP16
         trust_remote_code=True,
         device_map="auto",
         attn_implementation="sdpa",
@@ -92,15 +93,15 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
         max_length=args.max_seq_length,
-        packing=True,
+        packing=False, # Disable packing for speed on T4
         optim="paged_adamw_8bit",
         dataloader_num_workers=0,
     )
 
-    # Expanded LoRA targets for 2B model to capture complex logic
+    # Balanced LoRA rank for 2B teacher
     peft_config = LoraConfig(
-        r=64,
-        lora_alpha=128,
+        r=32,
+        lora_alpha=64,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
