@@ -28,7 +28,7 @@ if "CUDA_VISIBLE_DEVICES" not in os.environ:
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from data_loader import load_sdft_dataset, format_prompt
 from utils import format_target

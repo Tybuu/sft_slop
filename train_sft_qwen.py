@@ -4,7 +4,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_from_disk
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig
@@ -14,11 +14,11 @@ def main():
     parser.add_argument("--dataset", type=str, default="tooluse")
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_acc", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     args = parser.parse_args()
 
@@ -28,33 +28,15 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Quantization config for 2B model on T4
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16 
-    )
-
-    print(f"Loading model (Strict FP16): {args.model_path}")
-    from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-    config.torch_dtype = torch.float16 # Override BF16 default
+    print(f"Loading model (FP16): {args.model_path}")
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        config=config,
-        quantization_config=bnb_config,
         torch_dtype=torch.float16,
         trust_remote_code=True,
         device_map="auto",
         attn_implementation="sdpa",
     )
-    
-    # CRITICAL: Manually cast norm/embed layers to FP16 to avoid GradScaler crash
-    for name, module in model.named_modules():
-        if "norm" in name.lower() or "embed" in name.lower():
-            module.to(torch.float16)
 
     print(f"Loading dataset: {args.dataset}")
     raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"

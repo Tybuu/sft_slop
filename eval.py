@@ -110,16 +110,14 @@ def main():
     if args.limit:
         eval_data = eval_data[:args.limit]
 
-    # For ToolUse, we need the original dataset items for golden_answer
-    raw_eval_ds = None
-    if args.dataset == "tooluse":
-        from datasets import load_from_disk
-        raw_eval_ds = load_from_disk('sdft_repo/data/tooluse_data/eval_data')
+    # Load raw dataset for dataset-specific fields
+    from datasets import load_from_disk
+    raw_eval_ds = load_from_disk(f'sdft_repo/data/{args.dataset}_data/eval_data')
 
     results = []
     correct = 0
 
-    print("Running evaluation (batch_size={args.batch_size}) ...")
+    print(f"Running evaluation (batch_size={args.batch_size}) ...")
     
     # Process in batches
     for i in tqdm(range(0, len(eval_data), args.batch_size)):
@@ -127,9 +125,16 @@ def main():
         
         # Apply chat template to each prompt in the batch
         formatted_prompts = []
-        for item in batch_items:
+        for b_idx, item in enumerate(batch_items):
+            global_idx = i + b_idx
+            # Use dataset-specific system prompt
+            if args.dataset == "tooluse":
+                system_content = "You are a helpful assistant."
+            else:
+                system_content = raw_eval_ds[global_idx]['prompt'][0]['content']
+
             messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": format_prompt(item)}
             ]
             formatted_prompts.append(
@@ -149,7 +154,6 @@ def main():
                 **inputs, 
                 max_new_tokens=args.max_tokens, 
                 do_sample=False,
-                repetition_penalty=1.1,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 # Stop if it tries to start a new turn

@@ -12,3 +12,6 @@ huggingface-hub
 tiktoken
 numpy
 scipy
+# flash-linear-attention and causal-conv1d require --no-build-isolation:
+#   pip install flash-linear-attention
+#   pip install causal-conv1d --no-build-isolation
