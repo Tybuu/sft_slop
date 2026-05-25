@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_acc", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     args = parser.parse_args()
@@ -33,18 +33,28 @@ def main():
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16 # Compute in FP16 for T4
+        bnb_4bit_compute_dtype=torch.float16 
     )
 
-    print(f"Loading model (4-bit FP16): {args.model_path}")
+    print(f"Loading model (Strict FP16): {args.model_path}")
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    config.torch_dtype = torch.float16 # Override BF16 default
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        config=config,
         quantization_config=bnb_config,
-        torch_dtype=torch.float16, # Force non-quantized layers to FP16
+        torch_dtype=torch.float16,
         trust_remote_code=True,
         device_map="auto",
         attn_implementation="sdpa",
     )
+    
+    # CRITICAL: Manually cast norm/embed layers to FP16 to avoid GradScaler crash
+    for name, module in model.named_modules():
+        if "norm" in name.lower() or "embed" in name.lower():
+            module.to(torch.float16)
 
     print(f"Loading dataset: {args.dataset}")
     raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"
