@@ -63,8 +63,11 @@ def build_example_inputs(tokenizer, prompt: str, response: str, max_length: int)
     """
     Tokenize using the Qwen chat template to match SFT training.
     """
+    # SYSTEM PROMPT: Matches eval.py and train_sft_qwen.py exactly
+    SYSTEM_PROMPT = "You are a helpful assistant."
+
     messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
         {"role": "assistant", "content": response}
     ]
@@ -192,12 +195,21 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # Quantization for memory efficiency
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16
+    )
+
     teacher = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
-        torch_dtype=torch.float16,
+        quantization_config=bnb_config,
         trust_remote_code=True,
         attn_implementation="sdpa",
-    ).to(device)
+        device_map="auto",
+    )
     teacher.eval()
     
     # Wrap model to compute top-K probabilities locally on each GPU

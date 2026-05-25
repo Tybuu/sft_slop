@@ -1,10 +1,10 @@
 import argparse
 import os
-# Restrict to a single GPU for maximum speed on small models
+# Restrict to a single GPU for maximum speed and stability
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from datasets import load_from_disk
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig
@@ -12,42 +12,48 @@ from peft import LoraConfig
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="tooluse")
-    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-0.8B")
-    parser.add_argument("--output_dir", type=str, default="./qwen-sft-tooluse")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_acc", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_seq_length", type=int, default=1024)
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Specific checkpoint path to resume from.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     args = parser.parse_args()
 
     print(f"Loading tokenizer: {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    
-    # Qwen tokenizer needs a pad token if it's not set
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print(f"Loading model: {args.model_path}")
+    # Quantization config for 2B model on T4
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16
+    )
+
+    print(f"Loading model (4-bit): {args.model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float16, # T4 is FP16-only
+        quantization_config=bnb_config,
         trust_remote_code=True,
         device_map="auto",
-        attn_implementation="sdpa", # Force the fast/memory-efficient path
+        attn_implementation="sdpa",
     )
 
     print(f"Loading dataset: {args.dataset}")
     raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"
-    print(f"Loading raw dataset from {raw_path}")
     dataset = load_from_disk(raw_path)
 
-    # Format dataset for conversational SFT
     from utils import format_target
     
+    # SYSTEM PROMPT: Matches eval.py exactly
+    SYSTEM_PROMPT = "You are a helpful assistant."
+
     def format_dataset(example):
         if args.dataset == "science":
             return {
@@ -61,7 +67,7 @@ def main():
             target = format_target(example['golden_response'][0])
             return {
                 "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": example["prompt"]},
                     {"role": "assistant", "content": target}
                 ]
@@ -81,19 +87,24 @@ def main():
         weight_decay=0.01,
         logging_steps=10,
         save_strategy="epoch",
-        fp16=True, # T4 doesn't support BF16
+        fp16=True,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to="none",
         max_length=args.max_seq_length,
-        packing=True, # Pack multiple examples into one sequence for speed
-        optim="adamw_8bit",
+        packing=True,
+        optim="paged_adamw_8bit",
         dataloader_num_workers=0,
     )
 
+    # Expanded LoRA targets for 2B model to capture complex logic
     peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        r=64,
+        lora_alpha=128,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -107,26 +118,19 @@ def main():
         peft_config=peft_config,
     )
 
-    print("Starting Normal Fine-Tuning (SFT) on Qwen...")
+    print("Starting Expert Teacher Fine-Tuning (2B)...")
     
-    # Check for existing checkpoints to resume from
     resume_from_checkpoint = args.resume_from_checkpoint
     if resume_from_checkpoint is None and os.path.isdir(args.output_dir):
-        checkpoints = [
-            os.path.join(args.output_dir, d) 
-            for d in os.listdir(args.output_dir) 
-            if d.startswith("checkpoint-")
-        ]
+        checkpoints = [os.path.join(args.output_dir, d) for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")]
         if checkpoints:
             checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
             resume_from_checkpoint = checkpoints[-1]
-            print(f"Auto-resuming from latest checkpoint: {resume_from_checkpoint}")
-    elif resume_from_checkpoint is not None:
-        print(f"Resuming from specified checkpoint: {resume_from_checkpoint}")
+            print(f"Auto-resuming from: {resume_from_checkpoint}")
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     
-    print(f"Saving model to {args.output_dir}")
+    print(f"Saving expert model to {args.output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(args.output_dir)
 

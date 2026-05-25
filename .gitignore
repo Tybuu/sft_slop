@@ -2,6 +2,7 @@
 .direnv/
 .venv/
 __pycache__/
+.antigravitycli/
 *.pyc
 *.log
 t5-sft-*
