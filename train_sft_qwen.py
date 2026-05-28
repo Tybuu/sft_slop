@@ -1,7 +1,5 @@
 import argparse
 import os
-# Restrict to a single GPU for maximum speed and stability
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -15,11 +13,13 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--grad_acc", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--grad_acc", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--dataset_path", type=str, default=None,
+                        help="Custom path to training dataset. Defaults to sdft_repo/data/{dataset}_data/train_data")
     args = parser.parse_args()
 
     print(f"Loading tokenizer: {args.model_path}")
@@ -28,28 +28,21 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print(f"Loading model (FP16): {args.model_path}")
-
+    print(f"Loading model (BF16): {args.model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         device_map="auto",
         attn_implementation="sdpa",
     )
 
-    # Force every parameter to FP16 — Qwen3.5 defaults to BF16 in config
-    for p in model.parameters():
-        if p.dtype == torch.bfloat16:
-            p.data = p.data.to(torch.float16)
-
     print(f"Loading dataset: {args.dataset}")
-    raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"
+    raw_path = args.dataset_path or f"sdft_repo/data/{args.dataset}_data/train_data"
     dataset = load_from_disk(raw_path)
 
     from utils import format_target
-    
-    # SYSTEM PROMPT: Matches eval.py exactly
+
     SYSTEM_PROMPT = "You are a helpful assistant."
 
     def format_dataset(example):
@@ -85,17 +78,16 @@ def main():
         weight_decay=0.01,
         logging_steps=10,
         save_strategy="epoch",
-        fp16=True,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        bf16=True,
         report_to="none",
         max_length=args.max_seq_length,
-        packing=False, # Disable packing for speed on T4
-        optim="paged_adamw_8bit",
-        dataloader_num_workers=0,
+        packing=False,
+        optim="adamw_torch",
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        ddp_find_unused_parameters=False,
     )
 
-    # Balanced LoRA rank for 2B teacher
     peft_config = LoraConfig(
         r=32,
         lora_alpha=64,
@@ -116,8 +108,8 @@ def main():
         peft_config=peft_config,
     )
 
-    print("Starting Expert Teacher Fine-Tuning (2B)...")
-    
+    print("Starting Expert Teacher Fine-Tuning...")
+
     resume_from_checkpoint = args.resume_from_checkpoint
     if resume_from_checkpoint is None and os.path.isdir(args.output_dir):
         checkpoints = [os.path.join(args.output_dir, d) for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")]
@@ -127,7 +119,7 @@ def main():
             print(f"Auto-resuming from: {resume_from_checkpoint}")
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-    
+
     print(f"Saving expert model to {args.output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(args.output_dir)
