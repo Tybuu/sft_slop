@@ -15,8 +15,8 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_acc", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_acc", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
@@ -38,6 +38,8 @@ def main():
         device_map="auto",
         attn_implementation="sdpa",
     ).cuda()
+    model.config.use_cache = False
+
     model.config.use_cache = False
 
     print(f"Loading dataset: {args.dataset}")
