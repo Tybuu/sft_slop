@@ -1,6 +1,8 @@
 import argparse
 import os
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_from_disk
@@ -13,8 +15,8 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--grad_acc", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--grad_acc", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
@@ -79,6 +81,8 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         bf16=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": True},
         report_to="none",
         max_length=args.max_seq_length,
         packing=False,
