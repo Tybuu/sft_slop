@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from data_loader import load_sdft_dataset, format_prompt
 from peft import PeftModel
 import json
@@ -53,6 +53,8 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for evaluation.")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                        help="Load base model in 4-bit (for QLoRA adapters).")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -70,11 +72,21 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     print(f"Loading model: {args.base_model}")
+    model_kwargs = dict(
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="sdpa",
+    )
+    if args.load_in_4bit:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation="sdpa"
+        **model_kwargs,
     ).to(device)
 
     if args.model_path != args.base_model:
