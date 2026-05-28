@@ -2,9 +2,8 @@
 train_online_distill.py
 
 Online knowledge distillation from Qwen3.5-4B (teacher, with a fine-tuned LoRA)
-to Qwen3.5-0.8B (student, output LoRA). Both models are held in GPU memory
-simultaneously so the teacher's full softmax output is used for KL divergence
-(no top-K approximation).
+to Qwen3.5-0.8B (student, output LoRA). Optimized for RTX 5090 (BF16 native,
+high bandwidth) — full-vocab KL divergence, no top-K approximation.
 
 Usage:
     # First, SFT-train a LoRA on the 4B teacher:
@@ -27,6 +26,9 @@ from datasets import load_from_disk
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
+
+# Allows TF32 matmul on Tensor Cores (RTX 5090 supports this natively)
+torch.set_float32_matmul_precision("medium")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -108,36 +110,32 @@ class OnlineDistillationTrainer(SFTTrainer):
             outputs = model(**inputs)
             return (outputs.loss, outputs) if return_outputs else outputs.loss
 
-        response_mask = (labels != -100)
-
-        # ── Teacher forward (no gradients) ──────────────────────────────────
+        # ── Teacher forward (no gradients, native BF16) ────────────────────
         with torch.inference_mode():
             t_outputs = self.teacher_model(**inputs)
-            t_logits = t_outputs.logits.float()  # (B, L, V)
-
-        t_logits_scaled = t_logits / self.temp
-        t_probs = F.softmax(t_logits_scaled, dim=-1)  # (B, L, V)
+            t_logits = t_outputs.logits  # (B, L, V) — stays BF16
 
         # ── Student forward ─────────────────────────────────────────────────
         s_outputs = model(**inputs)
-        s_logits = s_outputs.logits.float()  # (B, L, V)
+        s_logits = s_outputs.logits  # (B, L, V) — BF16
         loss_ce = s_outputs.loss
 
-        # ── Full-vocab KL over response tokens only ────────────────────────
-        response_positions = response_mask.nonzero(as_tuple=True)  # 2-tuple: (batch_idx, seq_idx)
+        # ── Full-vocab KL over response tokens ─────────────────────────────
+        response_mask = (labels != -100)
+        response_positions = response_mask.nonzero(as_tuple=True)
 
         if response_positions[0].numel() > 0:
-            # Gather teacher and student logits at response positions
-            t_resp = t_logits_scaled[response_positions[0], response_positions[1] - 1]  # (N, V)
-            s_resp = s_logits[response_positions[0], response_positions[1] - 1]  # (N, V)
+            # Gather response-position logits; shift by -1 to align predictions
+            t_resp = t_logits[response_positions[0], response_positions[1] - 1].float()  # (N, V)
+            s_resp = s_logits[response_positions[0], response_positions[1] - 1].float()
 
-            # Student log-softmax
-            s_log_probs = F.log_softmax(s_resp / self.temp, dim=-1)
+            t_resp /= self.temp
+            s_resp /= self.temp
 
-            # Teacher softmax (already scaled above)
-            t_resp_probs = t_probs[response_positions[0], response_positions[1] - 1]
+            t_probs = F.softmax(t_resp, dim=-1)
+            s_log_probs = F.log_softmax(s_resp, dim=-1)
 
-            loss_kd = F.kl_div(s_log_probs, t_resp_probs, reduction="batchmean") * (self.temp ** 2)
+            loss_kd = F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (self.temp ** 2)
 
             loss = (1.0 - self.alpha) * loss_ce + self.alpha * loss_kd
         else:
@@ -177,13 +175,13 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # ── Teacher model (4B) ─────────────────────────────────────────────────────
+    # ── Teacher model (4B) — BF16 on RTX 5090 ──────────────────────────────────
     print(f"Loading teacher model: {args.teacher_model}")
     teacher = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
         device_map="auto",
     )
     if args.teacher_lora_path is not None:
@@ -195,13 +193,13 @@ def main():
         p.requires_grad_(False)
     print("  Teacher ready (eval mode, frozen).")
 
-    # ── Student model (0.8B) ───────────────────────────────────────────────────
+    # ── Student model (0.8B) — BF16 ────────────────────────────────────────────
     print(f"Loading student model: {args.student_model}")
     student = AutoModelForCausalLM.from_pretrained(
         args.student_model,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
         device_map="auto",
     )
 
@@ -238,8 +236,8 @@ def main():
         weight_decay=0.01,
         warmup_ratio=0.05,
         max_grad_norm=1.0,
-        bf16=False,
-        fp16=True,
+        bf16=True,
+        fp16=False,
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=1,
