@@ -72,7 +72,7 @@ def main():
     print(f"Loading model: {args.base_model}")
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="sdpa"
     ).to(device)

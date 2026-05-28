@@ -37,7 +37,8 @@ def main():
         trust_remote_code=True,
         device_map="auto",
         attn_implementation="sdpa",
-    )
+    ).cuda()
+    model.config.use_cache = False
 
     print(f"Loading dataset: {args.dataset}")
     raw_path = args.dataset_path or f"sdft_repo/data/{args.dataset}_data/train_data"
@@ -82,11 +83,10 @@ def main():
         save_strategy="epoch",
         bf16=True,
         gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": True},
         report_to="none",
         max_length=args.max_seq_length,
         packing=False,
-        optim="adamw_torch",
+        optim="adamw_8bit",
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,

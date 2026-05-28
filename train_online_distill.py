@@ -18,13 +18,14 @@ Usage:
 
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import torch.nn.functional as F
 from datasets import load_from_disk
 from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
 # Allows TF32 matmul on Tensor Cores (RTX 5090 supports this natively)
@@ -162,10 +163,12 @@ def main():
     parser.add_argument("--batch_size",         type=int, default=1)
     parser.add_argument("--grad_acc",           type=int, default=16)
     parser.add_argument("--lr",                 type=float, default=5e-5)
-    parser.add_argument("--max_seq_length",     type=int, default=1024)
+    parser.add_argument("--max_seq_length",     type=int, default=2048)
     parser.add_argument("--alpha",              type=float, default=0.8)
     parser.add_argument("--temp",               type=float, default=2.0)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--dataset_path", type=str, default=None,
+                        help="Custom path to training dataset.")
     args = parser.parse_args()
 
     # ── Tokenizer ──────────────────────────────────────────────────────────────
@@ -175,11 +178,17 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # ── Teacher model (4B) — BF16 on RTX 5090 ──────────────────────────────────
-    print(f"Loading teacher model: {args.teacher_model}")
+    # ── Teacher model (4B) — 4-bit quantized to save memory ────────────────────
+    print(f"Loading teacher model (4-bit): {args.teacher_model}")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
     teacher = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
-        torch_dtype=torch.bfloat16,
+        quantization_config=bnb_config,
         trust_remote_code=True,
         attn_implementation="sdpa",
         device_map="auto",
@@ -189,9 +198,7 @@ def main():
         teacher = PeftModel.from_pretrained(teacher, args.teacher_lora_path)
         teacher = teacher.merge_and_unload()
     teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    print("  Teacher ready (eval mode, frozen).")
+    print("  Teacher ready (eval mode, frozen, 4-bit).")
 
     # ── Student model (0.8B) — BF16 ────────────────────────────────────────────
     print(f"Loading student model: {args.student_model}")
@@ -219,7 +226,7 @@ def main():
 
     # ── Dataset ────────────────────────────────────────────────────────────────
     print(f"Loading dataset: {args.dataset}")
-    raw_path = f"sdft_repo/data/{args.dataset}_data/train_data"
+    raw_path = args.dataset_path or f"sdft_repo/data/{args.dataset}_data/train_data"
     raw_dataset = load_from_disk(raw_path)
     formatted_dataset = prepare_online_distill_dataset(
         raw_dataset, args.dataset, tokenizer, args.max_seq_length
@@ -244,7 +251,7 @@ def main():
         optim="adamw_8bit",
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        dataloader_num_workers=0,
+        dataloader_num_workers=4,
         dataloader_pin_memory=True,
         packing=False,
         max_length=args.max_seq_length,
