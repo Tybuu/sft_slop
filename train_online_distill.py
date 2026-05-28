@@ -181,7 +181,7 @@ def main():
         args.teacher_model,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map="auto",
     )
     if args.teacher_lora_path is not None:
@@ -199,7 +199,7 @@ def main():
         args.student_model,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map="auto",
     )
 
