@@ -1,18 +1,19 @@
 """
 train_online_distill.py
 
-Online knowledge distillation from Qwen3.5-4B (teacher, with a fine-tuned LoRA)
-to Qwen3.5-0.8B (student, output LoRA). Optimized for RTX 5090 (BF16 native,
-high bandwidth) — full-vocab KL divergence, no top-K approximation.
+Online knowledge distillation from a teacher model (with a fine-tuned LoRA)
+to a student model (output LoRA). Both teacher and student run in BF16.
 
 Usage:
-    # First, SFT-train a LoRA on the 4B teacher:
-    python train_sft_qwen.py --dataset tooluse --model_path Qwen/Qwen3.5-4B \
-        --output_dir ./qwen-4b-expert --epochs 2 --batch_size 1 --grad_acc 8
+    # First, SFT-train a LoRA on the teacher (e.g. 2B model):
+    python train_sft_qwen.py --dataset tooluse --model_path Qwen/Qwen3.5-2B \
+        --output_dir ./qwen-2b-expert --epochs 2 --batch_size 1 --grad_acc 8
 
     # Then distill to 0.8B using the trained teacher LoRA:
     python train_online_distill.py --dataset tooluse \
-        --teacher_lora_path ./qwen-4b-expert \
+        --teacher_model Qwen/Qwen3.5-2B \
+        --teacher_lora_path ./qwen-2b-expert \
+        --dataset_path data/tooluse_data/train_data_fixed \
         --output_dir ./qwen-distilled-online
 """
 
@@ -25,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from datasets import load_from_disk
 from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
 # Allows TF32 matmul on Tensor Cores (RTX 5090 supports this natively)
@@ -99,7 +100,7 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
 # ── Distillation trainer ──────────────────────────────────────────────────────
 
 class OnlineDistillationTrainer(SFTTrainer):
-    def __init__(self, teacher_model, alpha=0.5, temp=2.0, *args, **kwargs):
+    def __init__(self, teacher_model, alpha=0.3, temp=1.0, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher_model = teacher_model
         self.alpha = alpha
@@ -162,10 +163,10 @@ def main():
     parser.add_argument("--epochs",             type=int, default=3)
     parser.add_argument("--batch_size",         type=int, default=1)
     parser.add_argument("--grad_acc",           type=int, default=16)
-    parser.add_argument("--lr",                 type=float, default=5e-5)
+    parser.add_argument("--lr",                 type=float, default=2e-4)
     parser.add_argument("--max_seq_length",     type=int, default=2048)
-    parser.add_argument("--alpha",              type=float, default=0.8)
-    parser.add_argument("--temp",               type=float, default=2.0)
+    parser.add_argument("--alpha",              type=float, default=0.3)
+    parser.add_argument("--temp",               type=float, default=1.0)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--dataset_path", type=str, default=None,
                         help="Custom path to training dataset.")
@@ -178,17 +179,11 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # ── Teacher model (4B) — 4-bit quantized to save memory ────────────────────
-    print(f"Loading teacher model (4-bit): {args.teacher_model}")
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
+    # ── Teacher model — BF16 (RTX 5090 has enough memory) ────────────────────────
+    print(f"Loading teacher model (BF16): {args.teacher_model}")
     teacher = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
-        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="sdpa",
         device_map="auto",
@@ -198,7 +193,7 @@ def main():
         teacher = PeftModel.from_pretrained(teacher, args.teacher_lora_path)
         teacher = teacher.merge_and_unload()
     teacher.eval()
-    print("  Teacher ready (eval mode, frozen, 4-bit).")
+    print("  Teacher ready (eval mode, frozen, BF16).")
 
     # ── Student model (0.8B) — BF16 ────────────────────────────────────────────
     print(f"Loading student model: {args.student_model}")
