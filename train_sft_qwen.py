@@ -104,7 +104,6 @@ def main():
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,
-        chat_template_kwargs={"enable_thinking": False},
     )
 
     peft_config = LoraConfig(
@@ -125,6 +124,7 @@ def main():
         train_dataset=formatted_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
+        chat_template_kwargs={"enable_thinking": False},
     )
 
     print("Starting Expert Teacher Fine-Tuning...")
