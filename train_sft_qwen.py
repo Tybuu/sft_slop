@@ -67,7 +67,8 @@ def main():
                     {"role": "system", "content": example["messages"][0]["content"]},
                     {"role": "user", "content": example["messages"][1]["content"]},
                     {"role": "assistant", "content": example["output_text"]}
-                ]
+                ],
+                "chat_template_kwargs": {"enable_thinking": False},
             }
         elif args.dataset == "tooluse":
             target = format_target(example['golden_response'][0])
@@ -76,7 +77,8 @@ def main():
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": example["prompt"]},
                     {"role": "assistant", "content": target}
-                ]
+                ],
+                "chat_template_kwargs": {"enable_thinking": False},
             }
         else:
             raise ValueError(f"Dataset {args.dataset} format not supported.")
@@ -103,6 +105,7 @@ def main():
         optim="paged_adamw_8bit",
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
+        remove_unused_columns=False,
         ddp_find_unused_parameters=False,
     )
 
@@ -124,7 +127,6 @@ def main():
         train_dataset=formatted_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
-        chat_template_kwargs={"enable_thinking": False},
     )
 
     print("Starting Expert Teacher Fine-Tuning...")
