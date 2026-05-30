@@ -100,7 +100,7 @@ def main():
         report_to="none",
         max_length=args.max_seq_length,
         packing=False,
-        optim="adamw_8bit",
+        optim="paged_adamw_8bit",
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,

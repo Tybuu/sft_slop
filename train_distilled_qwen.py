@@ -275,7 +275,7 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=1,
-        optim="adamw_torch",
+        optim="paged_adamw_8bit",
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         packing=False,

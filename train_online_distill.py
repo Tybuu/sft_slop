@@ -254,7 +254,7 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=1,
-        optim="adamw_8bit",
+        optim="paged_adamw_8bit",
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         dataloader_num_workers=4,
