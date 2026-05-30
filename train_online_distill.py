@@ -56,8 +56,8 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
             raise ValueError(f"Unsupported dataset: {dataset_name}")
 
         prompt_msgs = messages[:-1]
-        prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True)
-        full_ids = tokenizer.apply_chat_template(messages)
+        prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True, enable_thinking=False)
+        full_ids = tokenizer.apply_chat_template(messages, enable_thinking=False)
 
         if hasattr(prompt_ids, "input_ids"):
             prompt_ids = prompt_ids.input_ids

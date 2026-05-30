@@ -128,7 +128,7 @@ def main():
                 {"role": "user", "content": format_prompt(item)}
             ]
             formatted_prompts.append(
-                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             )
 
         inputs = tokenizer(
