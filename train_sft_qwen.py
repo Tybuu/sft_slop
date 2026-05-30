@@ -14,12 +14,22 @@ def main():
     parser.add_argument("--dataset", type=str, default="tooluse")
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_acc", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--lora_r", type=int, default=64,
+                        help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=128,
+                        help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout rate.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Warmup ratio for LR scheduler.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine",
+                        help="LR scheduler type (cosine, linear, etc.).")
     parser.add_argument("--dataset_path", type=str, default=None,
                         help="Custom path to training dataset. Defaults to sdft_repo/data/{dataset}_data/train_data")
     args = parser.parse_args()
@@ -85,6 +95,8 @@ def main():
         save_strategy="epoch",
         bf16=True,
         gradient_checkpointing=True,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
         report_to="none",
         max_length=args.max_seq_length,
         packing=False,
@@ -95,13 +107,13 @@ def main():
     )
 
     peft_config = LoraConfig(
-        r=32,
-        lora_alpha=64,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        lora_dropout=0.05,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )

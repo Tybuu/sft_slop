@@ -207,6 +207,16 @@ def main():
                         help="Distillation temperature.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Specific checkpoint path to resume from.")
+    parser.add_argument("--lora_r", type=int, default=64,
+                        help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=128,
+                        help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout rate.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Warmup ratio for LR scheduler.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine",
+                        help="LR scheduler type (cosine, linear, etc.).")
     parser.add_argument("--dataset_path", type=str, default=None,
                         help="Custom path to training dataset. Defaults to sdft_repo/data/{dataset}_data/train_data")
     args = parser.parse_args()
@@ -258,7 +268,8 @@ def main():
         gradient_accumulation_steps=args.grad_acc,
         learning_rate=args.lr,
         weight_decay=0.01,
-        warmup_ratio=0.05,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
         max_grad_norm=1.0,
         bf16=True,
         logging_steps=10,
@@ -275,13 +286,13 @@ def main():
     )
 
     peft_config = LoraConfig(
-        r=64,
-        lora_alpha=128,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        lora_dropout=0.05,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )

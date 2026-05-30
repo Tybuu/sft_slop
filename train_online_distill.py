@@ -167,6 +167,16 @@ def main():
     parser.add_argument("--max_seq_length",     type=int, default=2048)
     parser.add_argument("--alpha",              type=float, default=0.3)
     parser.add_argument("--temp",               type=float, default=1.0)
+    parser.add_argument("--lora_r", type=int, default=64,
+                        help="LoRA rank for student.")
+    parser.add_argument("--lora_alpha", type=int, default=128,
+                        help="LoRA alpha scaling for student.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout rate for student.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Warmup ratio for LR scheduler.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine",
+                        help="LR scheduler type (cosine, linear, etc.).")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--dataset_path", type=str, default=None,
                         help="Custom path to training dataset.")
@@ -206,13 +216,13 @@ def main():
     )
 
     student_peft_config = LoraConfig(
-        r=64,
-        lora_alpha=128,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        lora_dropout=0.05,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -236,7 +246,8 @@ def main():
         gradient_accumulation_steps=args.grad_acc,
         learning_rate=args.lr,
         weight_decay=0.01,
-        warmup_ratio=0.05,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
         max_grad_norm=1.0,
         bf16=True,
         fp16=False,
