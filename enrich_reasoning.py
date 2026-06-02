@@ -62,7 +62,7 @@ def extract_reasoning(text):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-27B-FP8")
+    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--dataset_path", type=str, default="data/tooluse_data/train_data_fixed")
     parser.add_argument("--output_dir", type=str, default="data/reasoning_dataset")
     parser.add_argument("--batch_size", type=int, default=1)
