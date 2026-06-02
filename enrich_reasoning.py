@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 
 def build_reasoning_prompt(tool_prompt, instruction, action, action_input):
-    return f"""Given a user query and available tools, explain step by step why you would choose a specific action and its input parameters.
+    return f"""Given a user query and available tools, briefly explain why the given action and parameters are correct.
 
 AVAILABLE TOOLS:
 {tool_prompt}
@@ -36,12 +36,9 @@ CORRECT ACTION:
 Action: {action}
 Action Input: {action_input}
 
-Now provide a detailed reasoning trace explaining WHY this action and input are correct. Consider:
-- What does the user want?
-- Which tool function should be used and why?
-- How do the parameters map to the user's request?
+Explain concisely (3-4 sentences): what does the user want, which tool and why, how parameters map to the request.
 
-Your reasoning (be detailed and thorough):"""
+Your reasoning:"""
 
 
 def extract_reasoning(text):
@@ -67,7 +64,7 @@ def main():
     parser.add_argument("--dataset_path", type=str, default="data/tooluse_data/train_data_fixed")
     parser.add_argument("--output_dir", type=str, default="data/reasoning_dataset")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--max_new_tokens", type=int, default=384)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
