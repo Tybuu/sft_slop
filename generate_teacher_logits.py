@@ -1,194 +1,251 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSeq2SeqLM
-from data_loader import load_sdft_dataset, format_prompt
-import json
-from tqdm import tqdm
-import os
-import argparse
+"""
+generate_qwen_teacher_logits.py
 
-def get_token_alignments(student_tokenizer, teacher_tokenizer, prompt, target):
-    """
-    Finds the mapping from student decoder token indices to teacher token indices.
-    We align the 'target' part only.
-    """
-    # Teacher sees full text
-    full_text = prompt + target
-    t_enc = teacher_tokenizer(full_text, return_offsets_mapping=True, add_special_tokens=False)
-    t_offsets = t_enc['offset_mapping']
-    
-    # Student decoder sees target
-    s_enc = student_tokenizer(target, return_offsets_mapping=True, add_special_tokens=False)
-    s_offsets = s_enc['offset_mapping']
-    
-    # Find where target starts in teacher offsets
-    prompt_len = len(prompt)
-    t_target_start_idx = 0
-    for idx, (start, end) in enumerate(t_offsets):
-        if start >= prompt_len:
-            t_target_start_idx = idx
-            break
-            
-    # map: student_decoder_idx -> teacher_idx (where student token ends)
-    alignment = {}
-    
-    t_ptr = t_target_start_idx
-    for s_idx, (s_start, s_end) in enumerate(s_offsets):
-        # s_start and s_end are relative to 'target'. We make them relative to 'full_text'
-        s_end_abs = s_end + prompt_len
-        
-        while t_ptr < len(t_offsets) and t_offsets[t_ptr][1] < s_end_abs:
-            t_ptr += 1
-            
-        if t_ptr < len(t_offsets) and t_offsets[t_ptr][1] == s_end_abs:
-            alignment[s_idx] = t_ptr
-            
-    return alignment, s_enc['input_ids'], t_enc['input_ids'], t_target_start_idx
+Pre-computes top-100 teacher logits from Qwen/Qwen3.5-2B for each training
+example and saves them to disk.  Because teacher and student share the same
+Qwen3.5 tokenizer there is no cross-vocab alignment step.
+"""
+
+import argparse
+import os
+
+import torch
+from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from data_loader import load_sdft_dataset, format_prompt
+from utils import format_target
+
+TOP_K = 100
+
+
+class TeacherWithTopK(torch.nn.Module):
+    def __init__(self, model, top_k=TOP_K):
+        super().__init__()
+        self.model = model
+        self.top_k = top_k
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        logits = outputs.logits
+        top_logits, top_indices = torch.topk(logits, self.top_k, dim=-1)
+        top_probs = torch.softmax(top_logits, dim=-1).half()
+        return top_probs, top_indices.to(torch.int32)
+
+
+def build_example_inputs(tokenizer, prompt: str, response: str, max_length: int):
+    SYSTEM_PROMPT = "You are a helpful assistant."
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": response}
+    ]
+
+    prompt_msgs = messages[:-1]
+    prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True)
+    full_ids = tokenizer.apply_chat_template(messages)
+
+    if hasattr(prompt_ids, "input_ids"):
+        prompt_ids = prompt_ids.input_ids
+    elif isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
+        prompt_ids = prompt_ids["input_ids"]
+
+    if hasattr(full_ids, "input_ids"):
+        full_ids = full_ids.input_ids
+    elif isinstance(full_ids, dict) and "input_ids" in full_ids:
+        full_ids = full_ids["input_ids"]
+
+    if hasattr(prompt_ids, "tolist"):
+        prompt_ids = prompt_ids.tolist()
+    if hasattr(full_ids, "tolist"):
+        full_ids = full_ids.tolist()
+
+    if len(full_ids) > max_length:
+        full_ids = full_ids[:max_length]
+
+    resp_start = len(prompt_ids)
+    resp_end = min(len(full_ids), max_length)
+
+    return full_ids, resp_start, resp_end
+
+
+class LogitDataset(Dataset):
+    def __init__(self, data, tokenizer, dataset_name, max_length):
+        self.features = []
+        print(f"Pre-tokenizing dataset (size: {len(data)}) …")
+        for item in tqdm(data, desc="Tokenizing"):
+            prompt = format_prompt(item)
+            if dataset_name == "tooluse":
+                response = format_target(item["target"])
+            else:
+                response = item["target"]
+
+            full_ids, resp_start, resp_end = build_example_inputs(
+                tokenizer, prompt, response, max_length
+            )
+            self.features.append({
+                "id": item["id"],
+                "input_ids": full_ids,
+                "resp_start": resp_start,
+                "resp_end": resp_end
+            })
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx]
+
+
+def collate_fn(batch, tokenizer):
+    max_len = max(len(ex["input_ids"]) for ex in batch)
+    padded_ids = []
+    attention_masks = []
+    ids = []
+    resp_starts = []
+    resp_ends = []
+    original_lens = []
+
+    for ex in batch:
+        original_len = len(ex["input_ids"])
+        pad_len = max_len - original_len
+        padded_ids.append([tokenizer.pad_token_id] * pad_len + ex["input_ids"])
+        attention_masks.append([0] * pad_len + [1] * original_len)
+        ids.append(ex["id"])
+        resp_starts.append(ex["resp_start"])
+        resp_ends.append(ex["resp_end"])
+        original_lens.append(original_len)
+
+    return {
+        "input_ids": torch.tensor(padded_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
+        "ids": ids,
+        "resp_starts": torch.tensor(resp_starts, dtype=torch.long),
+        "resp_ends": torch.tensor(resp_ends, dtype=torch.long),
+        "original_lens": torch.tensor(original_lens, dtype=torch.long),
+        "max_len": max_len
+    }
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="science")
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--dataset", type=str, default="tooluse",
+                        choices=["tooluse", "science"],
+                        help="Dataset to process.")
+    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-2B",
+                        help="HuggingFace model ID for the teacher.")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output .pt file path.")
+    parser.add_argument("--max_length", type=int, default=2048,
+                        help="Maximum sequence length.")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size per GPU(s).")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Truncate dataset.")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader workers.")
+    parser.add_argument("--compile", action="store_true",
+                        help="Compile the teacher model.")
+    parser.add_argument("--dataset_path", type=str, default=None,
+                        help="Custom path to training dataset.")
     args = parser.parse_args()
 
+    if args.output is None:
+        args.output = f"teacher_logits_qwen_{args.dataset}.pt"
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    teacher_id = "google/gemma-2-2b-it"
-    student_id = "google/flan-t5-small"
-    output_file = f"teacher_logits_{args.dataset}.pt"
-    top_k = 50
+    print(f"Device: {device}")
 
-    print(f"Loading teacher: {teacher_id}")
-    tokenizer_t = AutoTokenizer.from_pretrained(teacher_id)
-    from transformers import BitsAndBytesConfig
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_quant_type="nf4"
-    )
-    
-    model_t = AutoModelForCausalLM.from_pretrained(
-        teacher_id, 
-        quantization_config=quantization_config,
+    print(f"Loading teacher: {args.teacher_model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    teacher = AutoModelForCausalLM.from_pretrained(
+        args.teacher_model,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="sdpa",
         device_map="auto",
-        attn_implementation="sdpa"
     )
-    
-    print(f"Loading student tokenizer: {student_id}")
-    tokenizer_s = AutoTokenizer.from_pretrained(student_id)
-    
-    # Load vocab map to verify top-k matches
-    with open("vocab_map.json", "r") as f:
-        vocab_map = json.load(f)
-    t_to_s = {int(k): int(v) for k, v in vocab_map["teacher_to_student"].items()}
+    teacher.eval()
 
-    print(f"Loading data: {args.dataset}")
-    train_data = load_sdft_dataset(args.dataset, 'train')
+    # Wrap model to compute top-K probabilities locally on each GPU
+    teacher = TeacherWithTopK(teacher, TOP_K)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
+        teacher = torch.nn.DataParallel(teacher)
+
+    if args.compile:
+        print("Compiling teacher …")
+        teacher = torch.compile(teacher, mode="reduce-overhead", dynamic=True)
+
+    print(f"Loading dataset: {args.dataset}")
+    train_data = load_sdft_dataset(args.dataset, "train", dataset_path=args.dataset_path)
     if args.limit:
-        train_data = train_data[:args.limit]
-    
-    results = []
-    
-    # Resume check
-    if os.path.exists(output_file):
-        results = torch.load(output_file, weights_only=False)
-        processed_ids = set(item['id'] for item in results)
-        train_data = [item for item in train_data if item['id'] not in processed_ids]
-        print(f"Resuming from {len(processed_ids)} items.")
+        train_data = train_data[: args.limit]
 
-    print(f"Processing {len(train_data)} items...")
-    
-    from utils import format_target
-    for item in tqdm(train_data):
-        torch.cuda.empty_cache()
-        prompt = format_prompt(item)
-        if args.dataset == "tooluse":
-            target = format_target(item['target'])
-        else:
-            target = item['target']
-        
-        # Align with teacher
-        # Use add_special_tokens=True for student to match training (adds EOS)
-        s_enc = tokenizer_s(target, return_offsets_mapping=True, add_special_tokens=True)
-        s_ids = s_enc['input_ids']
-        s_offsets = s_enc['offset_mapping']
-        
-        # Teacher alignment remains similar but must match absolute offsets
-        full_text = prompt + target
-        t_enc = tokenizer_t(full_text, return_offsets_mapping=True, add_special_tokens=False)
-        t_ids = t_enc['input_ids']
-        t_offsets = t_enc['offset_mapping']
-        
-        # Find where target starts in teacher offsets
-        prompt_len = len(prompt)
-        t_target_start_idx = 0
-        for idx, (start, end) in enumerate(t_offsets):
-            if start >= prompt_len:
-                t_target_start_idx = idx
-                break
-                
-        # align_map: student_decoder_idx -> teacher_idx
-        align_map = {}
-        t_ptr = t_target_start_idx
-        for s_idx, (s_start, s_end) in enumerate(s_offsets):
-            s_end_abs = s_end + prompt_len
-            while t_ptr < len(t_offsets) and t_offsets[t_ptr][1] < s_end_abs:
-                t_ptr += 1
-            if t_ptr < len(t_offsets) and t_offsets[t_ptr][1] == s_end_abs:
-                align_map[s_idx] = t_ptr
-        
-        # Prepare teacher input
-        inputs_t = tokenizer_t(
-            full_text, 
-            return_tensors="pt", 
-            truncation=True, 
-            max_length=1536
-        ).to(device)
-        
-        with torch.no_grad():
-            outputs = model_t(**inputs_t)
-            logits = outputs.logits[0] # [seq_len, vocab_size]
-            
-        item_top_probs = []
-        item_top_indices = []
-        item_s_indices = [] # Which student decoder token this refers to
-        
-        for s_idx in range(len(s_ids)):
-            # To predict student decoder token s_idx, we need teacher logit at position align_map[s_idx-1] + 1
-            # or if s_idx is 0, we need teacher logit at the position just before the target starts + 1.
-            
-            if s_idx == 0:
-                is_aligned = (align_map.get(0) == t_target_start_idx)
-                t_pos = t_target_start_idx - 1
-            else:
-                prev_t_pos = align_map.get(s_idx - 1)
-                curr_t_pos = align_map.get(s_idx)
-                is_aligned = (prev_t_pos is not None and curr_t_pos is not None and curr_t_pos == prev_t_pos + 1)
-                t_pos = prev_t_pos if prev_t_pos is not None else None
-            
-            if is_aligned and t_pos is not None and t_pos < len(logits):
-                # Get top-k from teacher distribution
-                p = torch.softmax(logits[t_pos].float(), dim=-1)
-                top_p, top_i = torch.topk(p, top_k)
-                
-                item_top_probs.append(top_p.cpu().half())
-                item_top_indices.append(top_i.cpu().int())
-                item_s_indices.append(s_idx)
-        
-        if item_top_probs:
+    results: list[dict] = []
+    processed_ids: set[str] = set()
+    if os.path.exists(args.output):
+        results = torch.load(args.output, weights_only=False)
+        processed_ids = {item["id"] for item in results}
+        train_data = [ex for ex in train_data if ex["id"] not in processed_ids]
+        print(f"Resuming — {len(processed_ids)} done, {len(train_data)} remaining.")
+
+    dataset = LogitDataset(train_data, tokenizer, args.dataset, args.max_length)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.num_workers,
+        collate_fn=lambda b: collate_fn(b, tokenizer),
+        pin_memory=True
+    )
+
+    save_every = 500
+    print(f"Processing {len(train_data)} examples with batch_size={args.batch_size} …")
+
+    for idx, batch in enumerate(tqdm(dataloader)):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+        with torch.inference_mode():
+            top_probs, top_indices = teacher(input_ids=input_ids, attention_mask=attention_mask)
+
+        max_len = batch["max_len"]
+        for i in range(len(batch["ids"])):
+            example_id = batch["ids"][i]
+            resp_start = batch["resp_starts"][i].item()
+            resp_end = batch["resp_ends"][i].item()
+            original_len = batch["original_lens"][i].item()
+
+            pad_offset = max_len - original_len
+            first_logit_idx = pad_offset + resp_start - 1
+            last_logit_idx  = pad_offset + resp_end - 1
+
+            if first_logit_idx < 0 or last_logit_idx <= first_logit_idx:
+                continue
+
+            example_top_probs = top_probs[i, first_logit_idx:last_logit_idx, :]
+            example_top_indices = top_indices[i, first_logit_idx:last_logit_idx, :]
+
             results.append({
-                'id': item['id'],
-                's_indices': torch.tensor(item_s_indices, dtype=torch.int32),
-                'top_probs': torch.stack(item_top_probs),
-                'top_indices': torch.stack(item_top_indices)
+                "id":          example_id,
+                "top_probs":   example_top_probs.cpu(),
+                "top_indices": example_top_indices.cpu(),
             })
 
-        # Save periodically
-        if len(results) % 50 == 0:
-            torch.save(results, output_file)
+        if (idx + 1) % (save_every // args.batch_size + 1) == 0:
+            torch.save(results, args.output)
 
-    if results:
-        torch.save(results, output_file)
-        
-    print(f"Done. Logits saved to {output_file}")
+    torch.save(results, args.output)
+    print(f"\nDone. {len(results)} examples saved.")
+
 
 if __name__ == "__main__":
     main()

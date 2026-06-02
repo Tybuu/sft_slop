@@ -50,11 +50,13 @@ def main():
                         help="Base model for LoRA adapter.")
     parser.add_argument("--dataset", type=str, default="science")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max_tokens", type=int, default=512)
+    parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for evaluation.")
     parser.add_argument("--load_in_4bit", action="store_true",
                         help="Load base model in 4-bit (for QLoRA adapters).")
+    parser.add_argument("--enable_thinking", action="store_true",
+                        help="Enable thinking mode for Qwen3.5.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -128,7 +130,7 @@ def main():
                 {"role": "user", "content": format_prompt(item)}
             ]
             formatted_prompts.append(
-                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=args.enable_thinking)
             )
 
         inputs = tokenizer(

@@ -1,100 +1,101 @@
 import argparse
 import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForSeq2SeqLM, 
-    Trainer, 
-    TrainingArguments, 
-    DataCollatorForSeq2Seq
-)
-from datasets import Dataset
-from data_loader import load_sdft_dataset, format_prompt
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import load_from_disk
+from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="tooluse")
-    parser.add_argument("--model_path", type=str, default="google/flan-t5-small")
-    parser.add_argument("--output_dir", type=str, default="./t5-sft-tooluse")
+    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--output_dir", type=str, default="./qwen-2b-expert")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_acc", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--max_input_length", type=int, default=1024)
-    parser.add_argument("--max_target_length", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_acc", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--lora_r", type=int, default=64,
+                        help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=128,
+                        help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout rate.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Warmup ratio for LR scheduler.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine",
+                        help="LR scheduler type (cosine, linear, etc.).")
+    parser.add_argument("--dataset_path", type=str, default=None,
+                        help="Custom path to training dataset. Defaults to sdft_repo/data/{dataset}_data/train_data")
+    parser.add_argument("--enable_thinking", action="store_true",
+                        help="Enable thinking mode for Qwen3.5 (uses thinking dataset with reasoning_content).")
     args = parser.parse_args()
 
-    print(f"Loading model and tokenizer: {args.model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_path)
+    print(f"Loading tokenizer: {args.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # T5 tokenizer does not natively support '<' as a token, resulting in <unk>.
-    # Add explicit XML tags as custom vocabulary tokens to avoid mangling and enable perfect tokenization.
-    special_tokens = ["<reasoning>", "</reasoning>", "<answer>", "</answer>"]
-    num_added_toks = tokenizer.add_tokens(special_tokens)
-    if num_added_toks > 0:
-        print(f"Added {num_added_toks} special tokens to the tokenizer.")
-        model.resize_token_embeddings(len(tokenizer))
+    print(f"Loading model (BF16): {args.model_path}")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+        attn_implementation="sdpa",
+    ).cuda()
+    model.config.use_cache = False
 
+    model.config.use_cache = False
+
+    from utils import format_target
 
     print(f"Loading dataset: {args.dataset}")
-    raw_train_data = load_sdft_dataset(args.dataset, 'train')
-    
-    from utils import format_target
-    
-    # Format data for HuggingFace Dataset
-    train_list = []
-    for item in raw_train_data:
-        if args.dataset == "tooluse":
-            target = format_target(item['target'])
+    raw_path = args.dataset_path or f"sdft_repo/data/{args.dataset}_data/train_data"
+    dataset = load_from_disk(raw_path)
+
+    SYSTEM_PROMPT = "You are a helpful assistant."
+
+    def format_dataset(example):
+        if args.dataset == "science":
+            return {
+                "messages": [
+                    {"role": "system", "content": example["messages"][0]["content"]},
+                    {"role": "user", "content": example["messages"][1]["content"]},
+                    {"role": "assistant", "content": example["output_text"]}
+                ],
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        elif args.dataset == "tooluse":
+            target = format_target(example['golden_response'][0])
+            if args.enable_thinking and "Action:" in target:
+                parts = target.split("Action:", 1)
+                reasoning = parts[0].strip()
+                action = "Action:" + parts[1]
+                assistant_msg = {"role": "assistant", "content": action.strip(), "reasoning_content": reasoning}
+            else:
+                assistant_msg = {"role": "assistant", "content": target}
+            return {
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": example["prompt"]},
+                    assistant_msg,
+                ],
+                "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
+            }
         else:
-            target = item['target']
-            
-        train_list.append({
-            "input_text": format_prompt(item),
-            "target_text": target
-        })
-    
-    train_dataset = Dataset.from_list(train_list)
+            raise ValueError(f"Dataset {args.dataset} format not supported.")
 
-    def preprocess_function(examples):
-        model_inputs = tokenizer(
-            examples["input_text"], 
-            max_length=args.max_input_length, 
-            truncation=True, 
-            padding="max_length"
-        )
+    formatted_dataset = dataset.map(format_dataset, remove_columns=dataset.column_names)
+    print(f"Formatted dataset: {len(formatted_dataset)} examples")
 
-        labels = tokenizer(
-            text_target=examples["target_text"], 
-            max_length=args.max_target_length, 
-            truncation=True, 
-            padding="max_length"
-        )
-
-        model_inputs["labels"] = labels["input_ids"]
-        # Replace padding token id's of the labels by -100 so it's ignored by the loss
-        model_inputs["labels"] = [
-            [(l if l != tokenizer.pad_token_id else -100) for l in label] 
-            for label in model_inputs["labels"]
-        ]
-        
-        # Debug: Print a non-empty label count for the first batch
-        if not hasattr(preprocess_function, "debug_done"):
-            non_pad = [l for l in model_inputs["labels"][0] if l != -100]
-            print(f"Debug: Example 0 has {len(non_pad)} non-pad tokens in target.")
-            preprocess_function.debug_done = True
-            
-        return model_inputs
-
-    print("Tokenizing dataset...")
-    tokenized_train = train_dataset.map(
-        preprocess_function, 
-        batched=True, 
-        remove_columns=["input_text", "target_text"]
-    )
-
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -102,27 +103,54 @@ def main():
         learning_rate=args.lr,
         weight_decay=0.01,
         logging_steps=10,
-        eval_strategy="no",
         save_strategy="epoch",
-        fp16=False, # T5 is unstable with FP16
+        bf16=True,
         gradient_checkpointing=True,
-        push_to_hub=False,
-        report_to="none"
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
+        report_to="none",
+        max_length=args.max_seq_length,
+        packing=False,
+        optim="paged_adamw_8bit",
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        remove_unused_columns=False,
+        ddp_find_unused_parameters=False,
     )
 
+    peft_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
 
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_train,
+        train_dataset=formatted_dataset,
         processing_class=tokenizer,
-        data_collator=DataCollatorForSeq2Seq(tokenizer, model=model),
+        peft_config=peft_config,
     )
 
-    print("Starting Normal Fine-Tuning (SFT)...")
-    trainer.train()
-    
-    print(f"Saving model to {args.output_dir}")
+    print("Starting Expert Teacher Fine-Tuning...")
+
+    resume_from_checkpoint = args.resume_from_checkpoint
+    if resume_from_checkpoint is None and os.path.isdir(args.output_dir):
+        checkpoints = [os.path.join(args.output_dir, d) for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")]
+        if checkpoints:
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+            resume_from_checkpoint = checkpoints[-1]
+            print(f"Auto-resuming from: {resume_from_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    print(f"Saving expert model to {args.output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(args.output_dir)
 

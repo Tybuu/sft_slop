@@ -1,240 +1,335 @@
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Trainer, TrainingArguments, DataCollatorForSeq2Seq
-from datasets import Dataset
-import json
+"""
+train_distilled_qwen.py
+
+Trains Qwen/Qwen3.5-0.8B (student) using knowledge distillation from
+pre-computed top-100 teacher logits produced by generate_qwen_teacher_logits.py.
+
+Because teacher and student share the same Qwen3.5 tokenizer there is no
+cross-vocabulary mapping: teacher top-100 indices are used directly.
+"""
+
 import argparse
 import os
-from data_loader import load_sdft_dataset, format_prompt
-import torch.nn.functional as F
 
-class DistillationTrainer(Trainer):
-    def __init__(self, model=None, args=None, data_collator=None, train_dataset=None, 
-                 eval_dataset=None, processing_class=None, model_init=None, compute_metrics=None, 
-                 callbacks=None, optimizers=(None, None), preprocess_logits_for_metrics=None,
-                 teacher_logits=None, vocab_map=None, alpha=0.5, temp=1.0, item_ids_map=None):
-        super().__init__(model=model, args=args, data_collator=data_collator, 
-                         train_dataset=train_dataset, eval_dataset=eval_dataset, 
-                         processing_class=processing_class, model_init=model_init, 
-                         compute_metrics=compute_metrics, callbacks=callbacks, 
-                         optimizers=optimizers, 
-                         preprocess_logits_for_metrics=preprocess_logits_for_metrics)
+import torch
+import torch.nn.functional as F
+from datasets import load_from_disk
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
+
+
+class DistillationDataCollator:
+    def __init__(self, base_collator):
+        self.base_collator = base_collator
+
+    def __call__(self, features):
+        example_ids = [f.get("example_id") for f in features]
+        cleaned_features = [
+            {k: v for k, v in f.items() if k != "example_id"}
+            for f in features
+        ]
+        batch = self.base_collator(cleaned_features)
+        batch["example_id"] = example_ids
+        return batch
+
+
+class CachedLogitsDistillationTrainer(SFTTrainer):
+
+    def __init__(self, teacher_logits: dict, alpha: float = 0.5,
+                 temp: float = 2.0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.teacher_logits = teacher_logits
-        self.vocab_map = vocab_map
         self.alpha = alpha
         self.temp = temp
-        self.item_ids_map = item_ids_map
-        self.kl_loss = torch.nn.KLDivLoss(reduction="batchmean")
-
-        if vocab_map is not None:
-            # Build pre-mapped vocabulary tensor
-            # Gemma-2-2B has 256000 tokens
-            self.vocab_map_tensor = torch.full((260000,), -1, dtype=torch.long)
-            for t_id_str, s_id in vocab_map.items():
-                t_id = int(t_id_str)
-                if t_id < 260000:
-                    self.vocab_map_tensor[t_id] = s_id
-
-        if teacher_logits is not None and vocab_map is not None:
-            print("Pre-mapping teacher logits to student vocabulary...")
-            for idx_str, item in self.teacher_logits.items():
-                t_indices = item["top_indices"].long()
-                t_indices = torch.clamp(t_indices, 0, 259999)
-                item["top_indices_mapped"] = self.vocab_map_tensor[t_indices]
+        self.data_collator = DistillationDataCollator(self.data_collator)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        item_indices = inputs.pop("item_idx", None)
-        labels = inputs.get("labels")
-        
-        outputs = model(**inputs)
-        student_logits = outputs.logits # (batch, seq, vocab)
+        example_ids = inputs.pop("example_id", None)
 
-        # Standard Cross-Entropy loss
+        outputs = model(**inputs)
+        student_logits = outputs.logits
         loss_ce = outputs.loss
-        
-        if self.teacher_logits is None or item_indices is None or self.item_ids_map is None:
+
+        if example_ids is None or self.teacher_logits is None:
             return (loss_ce, outputs) if return_outputs else loss_ce
 
-        # Distillation loss
-        loss_kd = 0
-        valid_kd_count = 0
-        device = student_logits.device
-        student_vocab_size = student_logits.size(-1)
-        
-        for i, item_idx in enumerate(item_indices):
-            idx = item_idx.item()
-            idx_str = self.item_ids_map[idx]
-            if idx_str not in self.teacher_logits:
-                continue
-                
-            teacher_data = self.teacher_logits[idx_str]
-            s_indices = teacher_data["s_indices"].long().to(device)
-            top_probs = teacher_data["top_probs"].to(device) # (seq_t, top_k)
-            top_indices_mapped = teacher_data["top_indices_mapped"].to(device) # (seq_t, top_k)
+        labels = inputs.get("labels")
+        if labels is None:
+            return (loss_ce, outputs) if return_outputs else loss_ce
 
-            # Filter indices that exceed current student logits sequence length
-            valid_s_mask = s_indices < student_logits.size(1)
-            s_indices = s_indices[valid_s_mask]
-            if len(s_indices) == 0:
-                continue
-            
-            top_probs = top_probs[valid_s_mask]
-            top_indices_mapped = top_indices_mapped[valid_s_mask]
-            seq_t = len(s_indices)
+        batch_t_probs = []
+        batch_t_indices = []
+        batch_s_logits = []
 
-            # Get student log probabilities for these selected tokens
-            s_logits_selected = student_logits[i, s_indices, :] # (seq_t, vocab)
-            s_log_probs = F.log_softmax(s_logits_selected / self.temp, dim=-1)
+        response_mask = (labels != -100)
 
-            # Create mask of valid mappings
-            mask = (top_indices_mapped >= 0) & (top_indices_mapped < student_vocab_size)
-
-            # Filter out invalid indices by replacing them with 0 (dummy) and zeroing out their probability
-            valid_indices = torch.where(mask, top_indices_mapped, torch.zeros_like(top_indices_mapped))
-            valid_probs = torch.where(mask, top_probs, torch.zeros_like(top_probs))
-
-            # Calculate sum of mapped probabilities before renormalization (Purity Thresholding)
-            mapped_sums = valid_probs.sum(dim=-1) # (seq_t,)
-            valid_step_mask = mapped_sums >= 0.5
-
-            if not valid_step_mask.any():
+        for b_idx, ex_id in enumerate(example_ids):
+            ex_id_str = ex_id if isinstance(ex_id, str) else str(ex_id.item())
+            if ex_id_str not in self.teacher_logits:
                 continue
 
-            # Only compute loss for valid steps
-            s_log_probs_valid = s_log_probs[valid_step_mask]
-            valid_indices = valid_indices[valid_step_mask]
-            valid_probs = valid_probs[valid_step_mask]
-            seq_t_valid = valid_step_mask.sum().item()
+            t_data = self.teacher_logits[ex_id_str]
+            t_probs = t_data["top_probs"]
+            t_indices = t_data["top_indices"]
 
-            # Renormalize the mapped probabilities for valid tokens
-            row_sums = valid_probs.sum(dim=-1, keepdim=True) + 1e-7
-            valid_probs = valid_probs / row_sums
+            resp_positions = response_mask[b_idx].nonzero(as_tuple=True)[0]
+            n_aligned = min(t_probs.size(0), resp_positions.size(0))
 
-            # Create target distribution tensor for valid steps
-            t_dist = torch.zeros(seq_t_valid, student_vocab_size, dtype=valid_probs.dtype, device=device)
+            if n_aligned > 0:
+                batch_t_probs.append(t_probs[:n_aligned])
+                batch_t_indices.append(t_indices[:n_aligned])
+                batch_s_logits.append(student_logits[b_idx, resp_positions[:n_aligned] - 1])
 
-            # Scatter the probabilities
-            t_dist.scatter_(1, valid_indices, valid_probs)
+        if not batch_t_probs:
+            return (loss_ce, outputs) if return_outputs else loss_ce
 
-            # KL Divergence (summed over valid tokens)
-            loss_kd += F.kl_div(s_log_probs_valid, t_dist, reduction="sum") * (self.temp ** 2)
-            valid_kd_count += seq_t_valid
+        all_t_probs = torch.cat(batch_t_probs, dim=0).to(student_logits.device, non_blocking=True)
+        all_t_indices = torch.cat(batch_t_indices, dim=0).to(student_logits.device, dtype=torch.long, non_blocking=True)
+        all_s_logits = torch.cat(batch_s_logits, dim=0).float()
 
-        if valid_kd_count > 0:
-            loss_kd /= valid_kd_count
-            loss = (1 - self.alpha) * loss_ce + self.alpha * loss_kd
+        s_logits_scaled = all_s_logits / self.temp
+
+        lse = torch.logsumexp(s_logits_scaled, dim=-1, keepdim=True)
+
+        V = s_logits_scaled.size(-1)
+        all_t_indices_clamped = all_t_indices.clamp(0, V - 1)
+
+        s_logits_sparse = s_logits_scaled.gather(1, all_t_indices_clamped)
+        s_log_probs_sparse = s_logits_sparse - lse
+
+        s_log_probs_sparse = s_log_probs_sparse.clamp(min=-50.0)
+
+        all_t_probs = all_t_probs.clamp(min=1e-9)
+        if self.temp != 1.0:
+            t_log_scaled = torch.log(all_t_probs) / self.temp
+            all_t_probs = torch.softmax(t_log_scaled, dim=-1)
         else:
-            loss = loss_ce
+            all_t_probs = all_t_probs / all_t_probs.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+
+        loss_kd = F.kl_div(
+            s_log_probs_sparse,
+            all_t_probs,
+            reduction="batchmean",
+        ) * (self.temp ** 2)
+
+        loss = (1.0 - self.alpha) * loss_ce + self.alpha * loss_kd
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            return loss_ce
 
         return (loss, outputs) if return_outputs else loss
 
+
+def prepare_distillation_dataset(raw_hf_dataset, dataset_name: str, tokenizer, max_length: int):
+    from utils import format_target
+
+    def _tokenize_and_align(example, idx):
+        if dataset_name == "science":
+            messages = [
+                {"role": "system",    "content": example["messages"][0]["content"]},
+                {"role": "user",      "content": example["messages"][1]["content"]},
+                {"role": "assistant", "content": example["output_text"]},
+            ]
+            example_id = f"science_train_{idx}"
+        elif dataset_name == "tooluse":
+            target = format_target(example["golden_response"][0])
+            messages = [
+                {"role": "system",    "content": "You are a helpful assistant."},
+                {"role": "user",      "content": example["prompt"]},
+                {"role": "assistant", "content": target},
+            ]
+            example_id = f"tooluse_train_{idx}"
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+        prompt_msgs = messages[:-1]
+        prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True, enable_thinking=False)
+        full_ids = tokenizer.apply_chat_template(messages, enable_thinking=False)
+
+        if hasattr(prompt_ids, "input_ids"):
+            prompt_ids = prompt_ids.input_ids
+        elif isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
+            prompt_ids = prompt_ids["input_ids"]
+
+        if hasattr(full_ids, "input_ids"):
+            full_ids = full_ids.input_ids
+        elif isinstance(full_ids, dict) and "input_ids" in full_ids:
+            full_ids = full_ids["input_ids"]
+
+        if hasattr(prompt_ids, "tolist"):
+            prompt_ids = prompt_ids.tolist()
+        if hasattr(full_ids, "tolist"):
+            full_ids = full_ids.tolist()
+
+        if len(full_ids) > max_length:
+            full_ids = full_ids[:max_length]
+
+        resp_start = len(prompt_ids)
+        resp_end = min(len(full_ids), max_length)
+
+        labels = [-100] * len(full_ids)
+        for i in range(resp_start, resp_end):
+            labels[i] = full_ids[i]
+
+        return {
+            "input_ids": full_ids,
+            "attention_mask": [1] * len(full_ids),
+            "labels": labels,
+            "example_id": example_id
+        }
+
+    print("Tokenizing and preparing dataset …")
+    return raw_hf_dataset.map(
+        _tokenize_and_align,
+        with_indices=True,
+        remove_columns=raw_hf_dataset.column_names,
+        num_proc=4,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="science")
-    parser.add_argument("--model_path", type=str, default="google/flan-t5-small")
-    parser.add_argument("--logits", type=str, default=None)
-    parser.add_argument("--vocab_map", type=str, default="vocab_map.json")
-    parser.add_argument("--output_dir", type=str, default="./t5-distilled-science")
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_acc", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--alpha", type=float, default=0.9)
-    parser.add_argument("--temp", type=float, default=1.0)
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--dataset",       type=str,   default="tooluse")
+    parser.add_argument("--student_model", type=str,   default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--logits_file",   type=str,   default=None,
+                        help="Path to .pt file from generate_qwen_teacher_logits.py. "
+                             "Defaults to teacher_logits_qwen_<dataset>.pt")
+    parser.add_argument("--output_dir",    type=str,   default="./qwen-distilled-tooluse")
+    parser.add_argument("--epochs",        type=int,   default=3)
+    parser.add_argument("--batch_size",    type=int,   default=16)
+    parser.add_argument("--grad_acc",      type=int,   default=2)
+    parser.add_argument("--lr",            type=float, default=5e-5)
+    parser.add_argument("--max_seq_length",type=int,   default=2048)
+    parser.add_argument("--alpha",         type=float, default=0.8,
+                        help="Weight of KD loss (0 = pure CE, 1 = pure KD).")
+    parser.add_argument("--temp",          type=float, default=2.0,
+                        help="Distillation temperature.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Specific checkpoint path to resume from.")
+    parser.add_argument("--lora_r", type=int, default=64,
+                        help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=128,
+                        help="LoRA alpha scaling.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout rate.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Warmup ratio for LR scheduler.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine",
+                        help="LR scheduler type (cosine, linear, etc.).")
+    parser.add_argument("--dataset_path", type=str, default=None,
+                        help="Custom path to training dataset. Defaults to sdft_repo/data/{dataset}_data/train_data")
     args = parser.parse_args()
 
-    if args.logits is None:
-        args.logits = f"teacher_logits_{args.dataset}.pt"
+    if args.logits_file is None:
+        args.logits_file = f"teacher_logits_qwen_{args.dataset}.pt"
 
-    print(f"Loading teacher logits from {args.logits}")
-    teacher_logits_list = torch.load(args.logits, weights_only=False)
-    # Convert list to dict keyed by item['id']
-    teacher_logits = {item['id']: item for item in teacher_logits_list}
-    
-    with open(args.vocab_map, "r") as f:
-        vocab_map = json.load(f)["teacher_to_student"]
+    if not os.path.exists(args.logits_file):
+        raise FileNotFoundError(
+            f"Teacher logits file not found: {args.logits_file}\n"
+            f"Run generate_qwen_teacher_logits.py first."
+        )
+    print(f"Loading teacher logits from {args.logits_file} …")
+    logits_list = torch.load(args.logits_file, map_location="cpu", weights_only=False)
+    print(f"  Raw logits loaded. Converting to dictionary …")
+    teacher_logits = {item["id"]: item for item in logits_list}
+    print(f"  {len(teacher_logits)} examples loaded and indexed.")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_path)
+    print(f"Loading tokenizer from {args.student_model}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.student_model, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # T5 tokenizer does not natively support '<' as a token, resulting in <unk>.
-    # Add explicit XML tags as custom vocabulary tokens to avoid mangling and enable perfect tokenization.
-    special_tokens = ["<reasoning>", "</reasoning>", "<answer>", "</answer>"]
-    num_added_toks = tokenizer.add_tokens(special_tokens)
-    if num_added_toks > 0:
-        print(f"Added {num_added_toks} special tokens to the tokenizer.")
-        model.resize_token_embeddings(len(tokenizer))
-
+    print(f"Loading student: {args.student_model}")
+    student_model = AutoModelForCausalLM.from_pretrained(
+        args.student_model,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="sdpa",
+        device_map="auto",
+    )
+    print("  Student model loaded.")
 
     print(f"Loading dataset: {args.dataset}")
-    raw_data = load_sdft_dataset(args.dataset, 'train')
-    
-    from utils import format_target
-    formatted_data = []
-    item_ids_map = []
-    for i, item in enumerate(raw_data):
-        item_ids_map.append(item['id'])
-        if args.dataset == "tooluse":
-            target = format_target(item['target'])
-        else:
-            target = item['target']
-            
-        formatted_data.append({
-            "input_text": format_prompt(item),
-            "target_text": target,
-            "item_idx": i
-        })
-    
-    dataset = Dataset.from_list(formatted_data)
-    
-    def tokenize_function(examples):
-        inputs = tokenizer(examples["input_text"], truncation=True, max_length=1024, padding="max_length")
-        targets = tokenizer(text_target=examples["target_text"], truncation=True, max_length=512, padding="max_length")
-        
-        labels = targets["input_ids"]
-        labels = [[(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels]
-        
-        inputs["labels"] = labels
-        inputs["item_idx"] = examples["item_idx"]
-        return inputs
-    
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["input_text", "target_text"])
+    raw_path = args.dataset_path or f"sdft_repo/data/{args.dataset}_data/train_data"
+    raw_dataset = load_from_disk(raw_path)
+    formatted_dataset = prepare_distillation_dataset(
+        raw_dataset, args.dataset, tokenizer, args.max_seq_length
+    )
+    print(f"Formatted dataset: {len(formatted_dataset)} examples")
 
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_acc,
         learning_rate=args.lr,
         weight_decay=0.01,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
+        max_grad_norm=1.0,
+        bf16=True,
         logging_steps=10,
-        eval_strategy="no",
         save_strategy="epoch",
-        fp16=False,
-        gradient_checkpointing=True,
-        push_to_hub=False,
+        save_total_limit=1,
+        optim="paged_adamw_8bit",
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        packing=False,
+        max_length=args.max_seq_length,
+        dataset_kwargs={"skip_prepare_dataset": True},
+        remove_unused_columns=False,
         report_to="none",
-        remove_unused_columns=False # Crucial for custom inputs like item_id
     )
 
-    trainer = DistillationTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-        processing_class=tokenizer,
-        data_collator=DataCollatorForSeq2Seq(tokenizer, model=model),
+    peft_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    trainer = CachedLogitsDistillationTrainer(
         teacher_logits=teacher_logits,
-        vocab_map=vocab_map,
         alpha=args.alpha,
         temp=args.temp,
-        item_ids_map=item_ids_map
+        model=student_model,
+        args=training_args,
+        train_dataset=formatted_dataset,
+        processing_class=tokenizer,
+        peft_config=peft_config,
     )
 
-    print("Starting training...")
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    
+    print("Starting distillation training …")
+
+    resume_from_checkpoint = args.resume_from_checkpoint
+    if resume_from_checkpoint is None and os.path.isdir(args.output_dir):
+        checkpoints = [
+            os.path.join(args.output_dir, d) 
+            for d in os.listdir(args.output_dir) 
+            if d.startswith("checkpoint-")
+        ]
+        if checkpoints:
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+            resume_from_checkpoint = checkpoints[-1]
+            print(f"Auto-resuming from latest checkpoint: {resume_from_checkpoint}")
+    elif resume_from_checkpoint is not None:
+        print(f"Resuming from specified checkpoint: {resume_from_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
     print(f"Saving model to {args.output_dir}")
     trainer.save_model()
+    tokenizer.save_pretrained(args.output_dir)
+
 
 if __name__ == "__main__":
     main()

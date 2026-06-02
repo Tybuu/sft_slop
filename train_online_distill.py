@@ -35,7 +35,7 @@ torch.set_float32_matmul_precision("medium")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_length):
+def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_length, enable_thinking=False):
     from utils import format_target
 
     def _tokenize_and_align(example, idx):
@@ -47,17 +47,24 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
             ]
         elif dataset_name == "tooluse":
             target = format_target(example["golden_response"][0])
+            if enable_thinking and "Action:" in target:
+                parts = target.split("Action:", 1)
+                reasoning = parts[0].strip()
+                action = "Action:" + parts[1]
+                assistant_msg = {"role": "assistant", "content": action.strip(), "reasoning_content": reasoning}
+            else:
+                assistant_msg = {"role": "assistant", "content": target}
             messages = [
                 {"role": "system",    "content": "You are a helpful assistant."},
                 {"role": "user",      "content": example["prompt"]},
-                {"role": "assistant", "content": target},
+                assistant_msg,
             ]
         else:
             raise ValueError(f"Unsupported dataset: {dataset_name}")
 
         prompt_msgs = messages[:-1]
-        prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True, enable_thinking=False)
-        full_ids = tokenizer.apply_chat_template(messages, enable_thinking=False)
+        prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True, enable_thinking=enable_thinking)
+        full_ids = tokenizer.apply_chat_template(messages, enable_thinking=enable_thinking)
 
         if hasattr(prompt_ids, "input_ids"):
             prompt_ids = prompt_ids.input_ids
@@ -180,6 +187,8 @@ def main():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--dataset_path", type=str, default=None,
                         help="Custom path to training dataset.")
+    parser.add_argument("--enable_thinking", action="store_true",
+                        help="Enable thinking mode for Qwen3.5 (uses thinking dataset with reasoning_content).")
     args = parser.parse_args()
 
     # ── Tokenizer ──────────────────────────────────────────────────────────────
@@ -234,7 +243,8 @@ def main():
     raw_path = args.dataset_path or f"sdft_repo/data/{args.dataset}_data/train_data"
     raw_dataset = load_from_disk(raw_path)
     formatted_dataset = prepare_online_distill_dataset(
-        raw_dataset, args.dataset, tokenizer, args.max_seq_length
+        raw_dataset, args.dataset, tokenizer, args.max_seq_length,
+        enable_thinking=args.enable_thinking,
     )
     print(f"Formatted dataset: {len(formatted_dataset)} examples")
 
@@ -288,8 +298,21 @@ def main():
         ]
         if checkpoints:
             checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
-            resume_from_checkpoint = checkpoints[-1]
-            print(f"Auto-resuming from latest checkpoint: {resume_from_checkpoint}")
+            candidate = checkpoints[-1]
+            adapter_config = os.path.join(candidate, "adapter_config.json")
+            if os.path.exists(adapter_config):
+                import json
+                with open(adapter_config) as f:
+                    cfg = json.load(f)
+                expected_r = args.lora_r
+                actual_r = cfg.get("r", -1)
+                if actual_r == expected_r:
+                    resume_from_checkpoint = candidate
+                    print(f"Auto-resuming from latest checkpoint: {resume_from_checkpoint}")
+                else:
+                    print(f"Found checkpoint {candidate} with r={actual_r} (expected r={expected_r}) — skipping auto-resume.")
+            else:
+                print(f"Found checkpoint {candidate} but no adapter_config.json — skipping auto-resume.")
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
