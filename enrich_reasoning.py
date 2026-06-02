@@ -47,6 +47,7 @@ Your reasoning (be detailed and thorough):"""
 def extract_reasoning(text):
     text = text.strip()
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    text = re.sub(r'^Thought:\s*', '', text, flags=re.IGNORECASE).strip()
     lines = text.split('\n')
     filtered = []
     for line in lines:
@@ -66,7 +67,7 @@ def main():
     parser.add_argument("--dataset_path", type=str, default="data/tooluse_data/train_data_fixed")
     parser.add_argument("--output_dir", type=str, default="data/reasoning_dataset")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--max_new_tokens", type=int, default=768)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
@@ -75,6 +76,7 @@ def main():
 
     print(f"Loading tokenizer: {args.teacher_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
