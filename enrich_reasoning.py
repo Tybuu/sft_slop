@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--dataset_path", type=str, default="data/tooluse_data/train_data_fixed")
     parser.add_argument("--output_dir", type=str, default="data/reasoning_dataset")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=768)
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
@@ -136,6 +136,9 @@ def main():
 
         enriched = []
         for raw in raw_outputs:
+            if start == 0 and len(enriched) < 1:
+                print(f"\n[DEBUG] Raw generation length: {len(raw)} chars, ~{len(raw.split())} words")
+                print(f"[DEBUG] Raw output preview:\n{raw[:500]}\n...\n{raw[-200:]}")
             reasoning = extract_reasoning(raw)
             enriched.append(reasoning)
 
