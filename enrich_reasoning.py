@@ -133,9 +133,6 @@ def main():
 
         enriched = []
         for raw in raw_outputs:
-            if start == 0 and len(enriched) < 1:
-                print(f"\n[DEBUG] Raw generation length: {len(raw)} chars, ~{len(raw.split())} words")
-                print(f"[DEBUG] Raw output preview:\n{raw[:500]}\n...\n{raw[-200:]}")
             reasoning = extract_reasoning(raw)
             enriched.append(reasoning)
 
