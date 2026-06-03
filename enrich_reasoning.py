@@ -26,7 +26,7 @@ from tqdm import tqdm
 def build_reasoning_prompt(tool_prompt, instruction, actions):
     action_section = "\n".join([f"Action: {act}\nAction Input: {inp}" for act, inp in actions])
     is_multi = len(actions) > 1
-    return f"""Given a user query and available tools, briefly explain why the given actions and parameters are correct.
+    return f"""Given a user query and available tools, VALIDATE that the given actions are correct and minimal.
 
 AVAILABLE TOOLS:
 {tool_prompt}
@@ -34,12 +34,12 @@ AVAILABLE TOOLS:
 USER QUERY:
 {instruction}
 
-CORRECT {'WORKFLOW' if is_multi else 'ACTION'}:
+ACTIONS TO VALIDATE:
 {action_section}
 
-Explain concisely (3-4 sentences): what does the user want, which tool{'s' if is_multi else ''} and why, how parameters map to the request.{' Explain the workflow, dependencies between steps, and why this order is correct.' if is_multi else ''}
+Concise validation (2-3 sentences): what does the user want? Do the actions match exactly with nothing extra or missing? Are all parameter values correct?{' Is the workflow order correct?' if is_multi else ''}
 
-Your reasoning:"""
+Your validation:"""
 
 
 def extract_reasoning(text):
@@ -52,7 +52,7 @@ def extract_reasoning(text):
         stripped = line.strip()
         if stripped.lower().startswith('action:') or stripped.lower().startswith('action input:'):
             break
-        if stripped.lower().startswith('your reasoning'):
+        if stripped.lower().startswith('your reasoning') or stripped.lower().startswith('your validation'):
             continue
         if stripped:
             filtered.append(stripped)
@@ -63,7 +63,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--dataset_path", type=str, default="data/tooluse_data/train_data_fixed")
-    parser.add_argument("--output_dir", type=str, default="data/reasoning_dataset")
+    parser.add_argument("--output_dir", type=str, default="data/validation_dataset")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--limit", type=int, default=None)
