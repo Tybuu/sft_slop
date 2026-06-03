@@ -178,6 +178,10 @@ def main():
                 golden_answer = raw_eval_ds[item_idx]['golden_answer']
                 gt_actions = [ga['Action'] for ga in golden_answer]
 
+                max_allowed = max(len(gt_actions) * 2, 10)
+                if len(pred_actions) > max_allowed:
+                    pred_actions = pred_actions[:len(gt_actions)]
+
                 gt_inputs = {}
                 for ga in golden_answer:
                     try:

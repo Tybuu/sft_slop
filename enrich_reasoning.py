@@ -23,8 +23,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 
-def build_reasoning_prompt(tool_prompt, instruction, action, action_input):
-    return f"""Given a user query and available tools, briefly explain why the given action and parameters are correct.
+def build_reasoning_prompt(tool_prompt, instruction, actions):
+    action_section = "\n".join([f"Action: {act}\nAction Input: {inp}" for act, inp in actions])
+    is_multi = len(actions) > 1
+    return f"""Given a user query and available tools, briefly explain why the given actions and parameters are correct.
 
 AVAILABLE TOOLS:
 {tool_prompt}
@@ -32,11 +34,10 @@ AVAILABLE TOOLS:
 USER QUERY:
 {instruction}
 
-CORRECT ACTION:
-Action: {action}
-Action Input: {action_input}
+CORRECT {'WORKFLOW' if is_multi else 'ACTION'}:
+{action_section}
 
-Explain concisely (3-4 sentences): what does the user want, which tool and why, how parameters map to the request.
+Explain concisely (3-4 sentences): what does the user want, which tool{'s' if is_multi else ''} and why, how parameters map to the request.{' Explain the workflow, dependencies between steps, and why this order is correct.' if is_multi else ''}
 
 Your reasoning:"""
 
@@ -64,7 +65,7 @@ def main():
     parser.add_argument("--dataset_path", type=str, default="data/tooluse_data/train_data_fixed")
     parser.add_argument("--output_dir", type=str, default="data/reasoning_dataset")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=384)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
@@ -99,9 +100,8 @@ def main():
         batch = ds.select(range(start_idx, min(start_idx + args.batch_size, len(ds))))
         prompts = []
         for ex in batch:
-            action = ex['golden_answer'][0]['Action']
-            action_input = ex['golden_answer'][0]['Action_Input']
-            prompts.append(build_reasoning_prompt(ex['prompt'], ex['instruction'], action, action_input))
+            actions = [(ga['Action'], ga['Action_Input']) for ga in ex['golden_answer']]
+            prompts.append(build_reasoning_prompt(ex['prompt'], ex['instruction'], actions))
 
         messages_batch = []
         for p in prompts:
@@ -148,16 +148,12 @@ def main():
             torch.cuda.empty_cache()
 
     def build_new_example(original, reasoning):
-        response = original['golden_response'][0]
-        if 'Action:' in response:
-            parts = response.split('Action:', 1)
-            action_part = 'Action:' + parts[1]
-        else:
-            action_part = response
-
-        new_response = f"Thought: {reasoning}\n{action_part.strip()}"
-        while '\n\n' in new_response:
-            new_response = new_response.replace('\n\n', '\n')
+        action_lines = []
+        for ga in original['golden_answer']:
+            action_lines.append(f"Action: {ga['Action']}")
+            action_lines.append(f"Action Input: {ga['Action_Input']}")
+        action_part = '\n'.join(action_lines)
+        new_response = f"Thought: {reasoning}\n{action_part}"
 
         return {
             **dict(original),
