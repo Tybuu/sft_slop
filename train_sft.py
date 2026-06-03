@@ -116,6 +116,7 @@ def main():
         dataloader_pin_memory=True,
         remove_unused_columns=False,
         ddp_find_unused_parameters=False,
+        dataset_kwargs={"chat_template_kwargs": {"enable_thinking": args.enable_thinking}},
     )
 
     peft_config = LoraConfig(

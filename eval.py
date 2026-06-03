@@ -142,15 +142,19 @@ def main():
         ).to(device)
 
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs, 
-                max_new_tokens=args.max_tokens, 
-                do_sample=False,
+            gen_kwargs = dict(
+                **inputs,
+                max_new_tokens=args.max_tokens,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 stop_strings=["<|im_start|>", "<|im_end|>", "User:", "Question:"],
-                tokenizer=tokenizer
+                tokenizer=tokenizer,
             )
+            if args.enable_thinking:
+                gen_kwargs.update(do_sample=True, temperature=0.6, top_p=0.95, top_k=20)
+            else:
+                gen_kwargs["do_sample"] = False
+            outputs = model.generate(**gen_kwargs)
 
             input_len = inputs.input_ids.shape[1]
             generated_ids = outputs[:, input_len:]

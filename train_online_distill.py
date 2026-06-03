@@ -271,7 +271,7 @@ def main():
         dataloader_pin_memory=True,
         packing=False,
         max_length=args.max_seq_length,
-        dataset_kwargs={"skip_prepare_dataset": True},
+        dataset_kwargs={"skip_prepare_dataset": True, "chat_template_kwargs": {"enable_thinking": args.enable_thinking}},
         remove_unused_columns=False,
         report_to="none",
     )
