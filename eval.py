@@ -133,21 +133,23 @@ def main():
                 tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=args.enable_thinking)
             )
 
+        prompt_max_length = 4096 if args.dataset == "science" else 2048
         inputs = tokenizer(
             formatted_prompts, 
             return_tensors="pt", 
             padding=True, 
             truncation=True, 
-            max_length=2048
+            max_length=prompt_max_length
         ).to(device)
 
         with torch.no_grad():
+            is_science = args.dataset == "science"
             gen_kwargs = dict(
                 **inputs,
-                max_new_tokens=args.max_tokens,
+                max_new_tokens=512 if is_science else args.max_tokens,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
-                stop_strings=["<|im_start|>", "<|im_end|>", "User:", "Question:"],
+                stop_strings=["<|im_start|>", "<|im_end|>", "User:", "Question:", "</answer>"] if is_science else ["<|im_start|>", "<|im_end|>", "User:", "Question:"],
                 tokenizer=tokenizer,
             )
             if args.enable_thinking:
