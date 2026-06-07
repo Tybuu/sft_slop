@@ -87,7 +87,13 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
             full_ids = full_ids.tolist()
 
         if len(full_ids) > max_length:
-            full_ids = full_ids[:max_length]
+            prompt_len = len(prompt_ids)
+            if prompt_len < max_length:
+                max_resp_len = max_length - prompt_len
+                response = full_ids[prompt_len:]
+                full_ids = full_ids[:prompt_len] + response[-max_resp_len:]
+            else:
+                full_ids = full_ids[:max_length]
 
         resp_start = len(prompt_ids)
         resp_end = min(len(full_ids), max_length)
