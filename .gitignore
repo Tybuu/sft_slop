@@ -8,3 +8,4 @@ __pycache__/
 t5-sft-*
 qwen-sft-*
 gpt2-distilled*
+481-sdft/

@@ -40,11 +40,11 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
 
     def _tokenize_and_align(example, idx):
         if dataset_name == "science":
-            messages = [
-                {"role": "system",    "content": example["messages"][0]["content"]},
-                {"role": "user",      "content": example["messages"][1]["content"]},
-                {"role": "assistant", "content": example["output_text"]},
+            prompt_msgs = [
+                {"role": "system", "content": example["messages"][0]["content"]},
+                {"role": "user",   "content": example["messages"][1]["content"]},
             ]
+            response_text = example["output_text"]
         elif dataset_name == "tooluse":
             target = format_target(example["golden_response"][0])
             if enable_thinking and "Action:" in target:
@@ -59,36 +59,50 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
                 {"role": "user",      "content": example["prompt"]},
                 assistant_msg,
             ]
+            prompt_msgs = messages[:-1]
         else:
             raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-        prompt_msgs = messages[:-1]
-        prompt_ids = tokenizer.apply_chat_template(prompt_msgs, add_generation_prompt=True, enable_thinking=enable_thinking)
-        full_ids = tokenizer.apply_chat_template(messages, enable_thinking=enable_thinking)
+        prompt_str = tokenizer.apply_chat_template(
+            prompt_msgs, tokenize=False,
+            add_generation_prompt=True, enable_thinking=enable_thinking,
+        )
+        prompt_ids = tokenizer(prompt_str, add_special_tokens=False)["input_ids"]
 
-        if hasattr(prompt_ids, "input_ids"):
-            prompt_ids = prompt_ids.input_ids
-        elif isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
-            prompt_ids = prompt_ids["input_ids"]
-        if hasattr(full_ids, "input_ids"):
-            full_ids = full_ids.input_ids
-        elif isinstance(full_ids, dict) and "input_ids" in full_ids:
-            full_ids = full_ids["input_ids"]
+        if len(prompt_ids) >= max_length:
+            return {
+                "input_ids": list(prompt_ids[:max_length]),
+                "attention_mask": [1] * max_length,
+                "labels": [-100] * max_length,
+            }
 
-        if hasattr(prompt_ids, "tolist"):
-            prompt_ids = prompt_ids.tolist()
-        if hasattr(full_ids, "tolist"):
-            full_ids = full_ids.tolist()
+        if dataset_name == "science":
+            response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
+            eos_id = tokenizer.eos_token_id
+            if eos_id is not None:
+                response_ids = list(response_ids) + [eos_id]
+        elif dataset_name == "tooluse":
+            full_ids = tokenizer.apply_chat_template(messages, enable_thinking=enable_thinking)
+            if hasattr(full_ids, "input_ids"):
+                full_ids = full_ids.input_ids
+            elif isinstance(full_ids, dict) and "input_ids" in full_ids:
+                full_ids = full_ids["input_ids"]
+            if hasattr(full_ids, "tolist"):
+                full_ids = full_ids.tolist()
+            response_ids = full_ids[len(prompt_ids):]
 
-        if len(full_ids) > max_length:
-            full_ids = full_ids[:max_length]
+        max_resp = max_length - len(prompt_ids)
+        if len(response_ids) > max_resp:
+            if max_resp <= 1:
+                response_ids = response_ids[:max_resp]
+            else:
+                response_ids = response_ids[:max_resp - 1]
+                eos_id = tokenizer.eos_token_id
+                if eos_id is not None:
+                    response_ids.append(eos_id)
 
-        resp_start = len(prompt_ids)
-        resp_end = min(len(full_ids), max_length)
-
-        labels = [-100] * len(full_ids)
-        for i in range(resp_start, resp_end):
-            labels[i] = full_ids[i]
+        full_ids = list(prompt_ids) + list(response_ids)
+        labels = [-100] * len(prompt_ids) + list(response_ids)
 
         return {
             "input_ids": full_ids,
@@ -107,11 +121,12 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
 # ── Distillation trainer ──────────────────────────────────────────────────────
 
 class OnlineDistillationTrainer(SFTTrainer):
-    def __init__(self, teacher_model, alpha=0.3, temp=1.0, *args, **kwargs):
+    def __init__(self, teacher_model, alpha=0.3, temp=1.0, kl_direction="forward", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher_model = teacher_model
         self.alpha = alpha
         self.temp = temp
+        self.kl_direction = kl_direction
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.get("labels")
@@ -141,10 +156,14 @@ class OnlineDistillationTrainer(SFTTrainer):
             t_resp /= self.temp
             s_resp /= self.temp
 
-            t_probs = F.softmax(t_resp, dim=-1)
-            s_log_probs = F.log_softmax(s_resp, dim=-1)
-
-            loss_kd = F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (self.temp ** 2)
+            if self.kl_direction == "reverse":
+                s_probs = F.softmax(s_resp, dim=-1)
+                t_log_probs = F.log_softmax(t_resp, dim=-1)
+                loss_kd = F.kl_div(t_log_probs, s_probs, reduction="batchmean") * (self.temp ** 2)
+            else:
+                t_probs = F.softmax(t_resp, dim=-1)
+                s_log_probs = F.log_softmax(s_resp, dim=-1)
+                loss_kd = F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (self.temp ** 2)
 
             loss = (1.0 - self.alpha) * loss_ce + self.alpha * loss_kd
         else:
@@ -189,6 +208,10 @@ def main():
                         help="Custom path to training dataset.")
     parser.add_argument("--enable_thinking", action="store_true",
                         help="Enable thinking mode for Qwen3.5 (uses thinking dataset with reasoning_content).")
+    parser.add_argument("--kl_direction", type=str, default="forward", choices=["forward", "reverse"],
+                        help="KL divergence direction: forward (KL(student||teacher)) or "
+                             "reverse (KL(teacher||student)). Reverse KL is mode-seeking, "
+                             "recommended for science dataset with lower temperature.")
     args = parser.parse_args()
 
     # ── Tokenizer ──────────────────────────────────────────────────────────────
@@ -281,6 +304,7 @@ def main():
         teacher_model=teacher,
         alpha=args.alpha,
         temp=args.temp,
+        kl_direction=args.kl_direction,
         model=student,
         args=training_args,
         train_dataset=formatted_dataset,
