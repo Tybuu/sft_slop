@@ -44,7 +44,13 @@ def prepare_online_distill_dataset(raw_hf_dataset, dataset_name, tokenizer, max_
                 {"role": "system", "content": example["messages"][0]["content"]},
                 {"role": "user",   "content": example["messages"][1]["content"]},
             ]
-            response_text = example["output_text"]
+            if enable_thinking and "</reasoning>" in example["output_text"]:
+                parts = example["output_text"].split("</reasoning>")
+                reasoning_part = parts[0] + "</reasoning>"
+                answer_part = parts[1]
+                response_text = reasoning_part + "\n</think>\n\n" + answer_part
+            else:
+                response_text = example["output_text"]
         elif dataset_name == "tooluse":
             target = format_target(example["golden_response"][0])
             if enable_thinking and "Action:" in target:

@@ -64,13 +64,22 @@ def main():
 
     def format_dataset(example):
         if args.dataset == "science":
+            if args.enable_thinking and "</reasoning>" in example["output_text"]:
+                parts = example["output_text"].split("</reasoning>")
+                assistant_msg = {
+                    "role": "assistant",
+                    "reasoning_content": parts[0] + "</reasoning>",
+                    "content": parts[1].strip(),
+                }
+            else:
+                assistant_msg = {"role": "assistant", "content": example["output_text"]}
             return {
                 "messages": [
                     {"role": "system", "content": example["messages"][0]["content"]},
                     {"role": "user", "content": example["messages"][1]["content"]},
-                    {"role": "assistant", "content": example["output_text"]}
+                    assistant_msg,
                 ],
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
             }
         elif args.dataset == "tooluse":
             target = format_target(example['golden_response'][0])
