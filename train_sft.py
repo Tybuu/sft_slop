@@ -62,47 +62,76 @@ def main():
 
     SYSTEM_PROMPT = "You are a helpful assistant."
 
-    def format_dataset(example):
-        if args.dataset == "science":
-            if args.enable_thinking and "</reasoning>" in example["output_text"]:
-                parts = example["output_text"].split("</reasoning>")
-                assistant_msg = {
-                    "role": "assistant",
-                    "reasoning_content": parts[0] + "</reasoning>",
-                    "content": parts[1].strip(),
-                }
-            else:
-                assistant_msg = {"role": "assistant", "content": example["output_text"]}
-            return {
-                "messages": [
+    def build_tokenized_dataset(raw_dataset):
+        def tokenize_row(example):
+            if args.dataset == "science":
+                prompt_msgs = [
                     {"role": "system", "content": example["messages"][0]["content"]},
-                    {"role": "user", "content": example["messages"][1]["content"]},
-                    assistant_msg,
-                ],
-                "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
-            }
-        elif args.dataset == "tooluse":
-            target = format_target(example['golden_response'][0])
-            if args.enable_thinking and "Action:" in target:
-                parts = target.split("Action:", 1)
-                reasoning = parts[0].strip()
-                action = "Action:" + parts[1]
-                assistant_msg = {"role": "assistant", "content": action.strip(), "reasoning_content": reasoning}
-            else:
-                assistant_msg = {"role": "assistant", "content": target}
-            return {
-                "messages": [
+                    {"role": "user",   "content": example["messages"][1]["content"]},
+                ]
+                if args.enable_thinking and "</reasoning>" in example["output_text"]:
+                    parts = example["output_text"].split("</reasoning>")
+                    reasoning_part = parts[0] + "</reasoning>"
+                    answer_part = parts[1]
+                    response_text = reasoning_part + "\n</think>\n\n" + answer_part
+                else:
+                    response_text = example["output_text"]
+            elif args.dataset == "tooluse":
+                target = format_target(example["golden_response"][0])
+                prompt_msgs = [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": example["prompt"]},
-                    assistant_msg,
-                ],
-                "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
-            }
-        else:
-            raise ValueError(f"Dataset {args.dataset} format not supported.")
+                    {"role": "user",   "content": example["prompt"]},
+                ]
+                if args.enable_thinking and "Action:" in target:
+                    parts = target.split("Action:", 1)
+                    reasoning = parts[0].strip()
+                    action = "Action:" + parts[1]
+                    response_text = reasoning + "\n</think>\n\n" + action
+                else:
+                    response_text = target
+            else:
+                raise ValueError(f"Dataset {args.dataset} format not supported.")
 
-    formatted_dataset = dataset.map(format_dataset, remove_columns=dataset.column_names)
-    print(f"Formatted dataset: {len(formatted_dataset)} examples")
+            prompt_str = tokenizer.apply_chat_template(
+                prompt_msgs, tokenize=False,
+                add_generation_prompt=True, enable_thinking=args.enable_thinking,
+            )
+            prompt_ids = tokenizer(prompt_str, add_special_tokens=False)["input_ids"]
+
+            if len(prompt_ids) >= args.max_seq_length:
+                return {
+                    "input_ids": list(prompt_ids[:args.max_seq_length]),
+                    "attention_mask": [1] * args.max_seq_length,
+                    "labels": [-100] * args.max_seq_length,
+                }
+
+            response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
+            eos_id = tokenizer.eos_token_id
+            if eos_id is not None:
+                response_ids = list(response_ids) + [eos_id]
+
+            max_resp = args.max_seq_length - len(prompt_ids)
+            if len(response_ids) > max_resp:
+                if max_resp <= 1:
+                    response_ids = response_ids[:max_resp]
+                else:
+                    response_ids = response_ids[:max_resp - 1]
+                    if eos_id is not None:
+                        response_ids.append(eos_id)
+
+            full_ids = list(prompt_ids) + list(response_ids)
+            labels = [-100] * len(prompt_ids) + list(response_ids)
+
+            return {
+                "input_ids": full_ids,
+                "attention_mask": [1] * len(full_ids),
+                "labels": labels,
+            }
+
+        return raw_dataset.map(tokenize_row, remove_columns=raw_dataset.column_names, num_proc=1)
+
+    tokenized_dataset = build_tokenized_dataset(dataset)
+    print(f"Tokenized dataset: {len(tokenized_dataset)} examples")
 
     training_args = SFTConfig(
         output_dir=args.output_dir,
@@ -118,14 +147,13 @@ def main():
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type=args.lr_scheduler_type,
         report_to="none",
-        max_length=args.max_seq_length,
         packing=False,
         optim="paged_adamw_8bit",
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
-        remove_unused_columns=False,
+        remove_unused_columns=True,
         ddp_find_unused_parameters=False,
-        dataset_kwargs={"chat_template_kwargs": {"enable_thinking": args.enable_thinking}},
+        dataset_kwargs={"skip_prepare_dataset": True},
     )
 
     peft_config = LoraConfig(
@@ -143,7 +171,7 @@ def main():
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=formatted_dataset,
+        train_dataset=tokenized_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
     )
